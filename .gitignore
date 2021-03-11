@@ -1,0 +1,8 @@
+*.ipynb
+config/
+fig/
+orig_code/
+csi_net/*log
+csi_net/*out
+csi_net/log/
+csi_net/__pycache__
