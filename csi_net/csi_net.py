@@ -5,6 +5,7 @@ from torch import nn
 from torch.autograd import Variable
 import torchvision
 from torchvision import transforms
+from collections import OrderedDict
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -78,15 +79,39 @@ class CsiNetQuant(nn.Module):
         self.device = device
         self.quant_bool = True
         self.training = True
+        self.p_hist = torch.zeros(self.quant.L).to(self.device) # histogram estimate of probabilities
+        # self.p_hard = torch.zeros(b,self.quant.n_features,self.quant.L).to(self.device)
 
     def forward(self, H_in):
         """forward call for VAE"""
         h_enc = self.encoder(H_in)
         return self.decoder(self.quant(h_enc)) if self.quant_bool else self.decoder(h_enc)
 
-    def latent_loss(self, z_mean, z_stddev):
-        """ if we want to do semi-supervised learning, then we could define the loss here """
-        pass
+    def crossentropy_loss(self, H_in, clip_val=1e-9):
+        """ calculate """
+        # temporarily store current quant_bool, sigma values
+        # self.p_hist = [0]*self.quant.L # init histogram estimate of probabilities
+        quant_mode_temp = self.quant.quant_mode
+        # sigma_temp = self.quant.state_dict()["sigma"][:]
+        # print(f"--- sigma_temp: {sigma_temp} ---")
+        self.quant.quant_mode = 2 # get softmax outputs
+        # self.quant.load_state_dict(OrderedDict({"sigma": torch.Tensor([1e4])}), strict=False) # large value of sigma -> hard quantization
+        q_soft = self.quant(self.encoder(H_in))
+        b = q_soft.shape[0]
+        # print(f'--- q_soft.shape={q_soft.shape} ---')
+        H_idx = torch.argmax(q_soft, dim=2)
+        # print(f'--- H_idx.shape={H_idx.shape} ---')
+        for val in range(self.quant.L):
+            num_val = torch.sum(H_idx == val)
+            self.p_hist[val] = torch.true_divide(num_val, self.quant.n_features*b)
+        p_hard = self.p_hist.view(1,1,self.quant.L).repeat(b,self.quant.n_features,1)
+        p_hard = torch.clamp(p_hard, clip_val, 1.0)
+        # print(f"--- p_hard: {p_hard} ---")
+        # store back original quant_mode, sigma values
+        self.quant.quant_mode = quant_mode_temp
+        # self.quant.load_state_dict(OrderedDict({"sigma": sigma_temp}), strict=False) # large value of sigma -> hard quantization
+        entropy_loss = -torch.sum(q_soft * torch.log2(p_hard)) / (self.quant.n_features*b)
+        return entropy_loss
 
 class SoftQuantize(torch.nn.Module):
     def __init__(self, r, L, m, sigma=0.1):
@@ -104,26 +129,29 @@ class SoftQuantize(torch.nn.Module):
         self.m = m # dim of centers
         self.n_features = int(r/m)
         self.softmax = nn.Softmax(dim=2)
-        self.pass_bool = True
+        self.quant_mode = 0 # 0 = pass through (no quantization), 1 = soft quantization, 2 = return softmax outputs
         
     def init_centers(self, c):
         self.c = torch.nn.Parameter(data=c, requires_grad=True)
-        self.pass_bool = False
+        self.quant_mode = 1
 
     def forward(self, x):
         """
         Take in latent features z, return soft assignment to clusters
         """
         b = x.shape[0]
-        if self.pass_bool:
-            return x
+        if self.quant_mode == 0:
+            return x # no quantization in latent layer
         else:
             z = x.view(b, self.n_features, self.m, 1).repeat(1, 1, 1, self.L)
             c = self.c.view(1,1,self.m,self.L).repeat(b, self.n_features, 1, 1)
             q = self.softmax(-self.sigma*torch.sum(torch.pow(z - c, 2), 2))
             c = self.c.view(1,self.m,self.L).repeat(b,1,1).transpose(2,1)
             out = torch.matmul(q, c)
-            return out.view(b, self.r)
+            if self.quant_mode == 1:
+                return out.view(b, self.r) # soft quantized outputs
+            elif self.quant_mode == 2:
+                return q # softmax outputs
 
 def energy_loss(y_gt, y_hat):
     return torch.mean(torch.sum(torch.pow(y_gt - y_hat, 2), dim=1))
@@ -151,7 +179,8 @@ if __name__ == "__main__":
     from utils.parsing import str2bool
     from utils.timing import Timer
     from utils.unpack_json import get_keys_from_json
-    from utils.trainer import fit, score, save_predictions, save_checkpoint_history
+    from utils.trainer import save_predictions, save_checkpoint_history
+    from trainer import fit, score, profile_network
 
     # set up timers
     timers = {
@@ -164,6 +193,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-d", "--debug_flag", type=int, default=0, help="flag for toggling debugging mode")
     parser.add_argument("-g", "--gpu_num", type=int, default=0, help="number for torch device (cuda:gpu_num)")
+    parser.add_argument("-p", "--pretrain_bool", type=str2bool, default=False, help="number for torch device (cuda:gpu_num)")
     parser.add_argument("-b", "--n_batch", type=int, default=20, help="number of batches to fit on (ignored during debug mode)")
     parser.add_argument("-l", "--dir", type=str, default=None, help="subdirectory for saving model, checkpoint, history")
     parser.add_argument("-e", "--env", type=str, default="indoor", help="environment (either indoor or outdoor)")
@@ -226,6 +256,7 @@ if __name__ == "__main__":
     for cr in cr_list:
         train_ldr = torch.utils.data.DataLoader(torch.from_numpy(data_train).to(device), batch_size=batch_size, shuffle=True) if opt.train_argv else None
         valid_ldr = torch.utils.data.DataLoader(torch.from_numpy(data_val).to(device), batch_size=batch_size)
+        all_ldr = torch.utils.data.DataLoader(torch.from_numpy(data_all).to(device), batch_size=batch_size)
 
         encoder = Encoder(input_dim[0], input_dim[1], opt.n_truncate, cr)
         decoder = Decoder(input_dim[0], input_dim[1], opt.n_truncate, cr)
@@ -234,66 +265,82 @@ if __name__ == "__main__":
 
         pickle_dir = f"{base_pickle}/cr{cr}/t1"
 
-        csinet_quant.quant.quant_bool = False # pretrain with no latent quantization
-        if opt.train_argv:
-            model, checkpoint, history, optimizer, timers = fit(csinet_quant,
-                                                                train_ldr,
-                                                                valid_ldr,
-                                                                batch_num,
-                                                                epochs=epochs,
-                                                                timers=timers,
-                                                                json_config=json_config,
-                                                                debug_flag=opt.debug_flag,
-                                                                pickle_dir=pickle_dir,
-                                                                network_name=f"{network_name}-pretrain")
+        if not opt.pretrain_bool:
+            csinet_quant.quant.quant_mode = 0 # pretrain with no latent quantization
+            if opt.train_argv:
+                model, checkpoint, history, optimizer, timers = fit(csinet_quant,
+                                                                    train_ldr,
+                                                                    valid_ldr,
+                                                                    batch_num,
+                                                                    epochs=epochs,
+                                                                    timers=timers,
+                                                                    json_config=json_config,
+                                                                    debug_flag=opt.debug_flag,
+                                                                    pickle_dir=pickle_dir,
+                                                                    network_name=f"{network_name}-pretrain")
 
-        all_ldr = torch.utils.data.DataLoader(torch.from_numpy(data_all).to(device), batch_size=batch_size)
-        [checkpoint, y_hat, y_test] = score(csinet_quant,
-                                            all_ldr,
-                                            data_all,
-                                            batch_num,
-                                            checkpoint,
-                                            history,
-                                            optimizer,
-                                            timers=timers,
-                                            json_config=json_config,
-                                            debug_flag=opt.debug_flag,
-                                            str_mod=f"CsiNetQuant CR={cr} (pretrain {epochs} epochs)",
-                                            n_train=data_train.shape[0],
-                                            pow_diff_t=pow_diff
-                                            )
 
-        if not opt.debug_flag:                
-            save_checkpoint_history(checkpoint, history, optimizer, dir=pickle_dir, network_name=f"{network_name}-pretrain")
+            [checkpoint, y_hat, y_test] = score(csinet_quant,
+                                                all_ldr,
+                                                data_all,
+                                                batch_num,
+                                                checkpoint,
+                                                history,
+                                                optimizer,
+                                                timers=timers,
+                                                json_config=json_config,
+                                                debug_flag=opt.debug_flag,
+                                                str_mod=f"CsiNetQuant CR={cr} (pretrain {epochs} epochs)",
+                                                n_train=data_train.shape[0],
+                                                pow_diff_t=pow_diff
+                                                )
 
-        # use encoder to get train/validation codewords
-        with torch.no_grad():
-            enc_train = csinet_quant.encoder(torch.from_numpy(data_train).to(device))
-            enc_valid = csinet_quant.encoder(torch.from_numpy(data_val).to(device))
-        enc_train_ldr = torch.utils.data.DataLoader(enc_train, batch_size=batch_size, shuffle=True)
-        enc_valid_ldr = torch.utils.data.DataLoader(enc_valid, batch_size=batch_size)
-        c = np.random.randint(enc_train.shape[0], size=opt.num_centers)
-        sampled_centers = enc_train.view(enc_train.shape[0]*int(opt.rate / opt.dim_centers), opt.dim_centers)[c,:]
-        print(f"--- sampled_centers.shape: {sampled_centers.shape} ---")
-        csinet_quant.quant.init_centers(sampled_centers)
+            if not opt.debug_flag:                
+                save_checkpoint_history(checkpoint, history, optimizer, dir=pickle_dir, network_name=f"{network_name}-pretrain")
 
-        fit(csinet_quant.quant,
-            enc_train_ldr,
-            enc_valid_ldr,
-            batch_num,
-            epochs=epochs,
-            timers=timers,
-            criterion=energy_loss,
-            json_config=json_config,
-            debug_flag=opt.debug_flag,
-            pickle_dir=pickle_dir,
-            network_name="soft-quant")
+            # use encoder to get train/validation codewords
+            with torch.no_grad():
+                enc_train = csinet_quant.encoder(torch.from_numpy(data_train).to(device))
+                enc_valid = csinet_quant.encoder(torch.from_numpy(data_val).to(device))
+            enc_train_ldr = torch.utils.data.DataLoader(enc_train, batch_size=batch_size, shuffle=True)
+            enc_valid_ldr = torch.utils.data.DataLoader(enc_valid, batch_size=batch_size)
+            c = np.random.randint(enc_train.shape[0], size=opt.num_centers)
+            sampled_centers = enc_train.view(enc_train.shape[0]*int(opt.rate / opt.dim_centers), opt.dim_centers)[c,:]
+            print(f"--- sampled_centers.shape: {sampled_centers.shape} ---")
+            csinet_quant.quant.init_centers(sampled_centers)
 
-        csinet_quant.quant.quant_bool = True # train with quantization layer
-        print(f"-> sigma: {csinet_quant.quant.sigma}")
+            fit(csinet_quant.quant,
+                enc_train_ldr,
+                enc_valid_ldr,
+                batch_num,
+                epochs=epochs,
+                timers=timers,
+                criterion=energy_loss,
+                json_config=json_config,
+                debug_flag=opt.debug_flag,
+                pickle_dir=pickle_dir,
+                network_name="soft-quant")
+
+            del enc_train_ldr, enc_valid_ldr
+
+        else:
+            print(f"--- Loading pretrained state_dict files for CsiNet-Quant --- ")
+            csinet_quant.quant.init_centers(torch.zeros(csinet_quant.quant.L, csinet_quant.quant.m).to(device))
+            csinet_quant.load_state_dict(torch.load(f"{pickle_dir}/{network_name}-pretrain-best-model.pt"), strict=False)
+            csinet_quant.quant.load_state_dict(torch.load(f"{pickle_dir}/soft-quant-best-model.pt"))
+
+        csinet_quant.quant.quant_mode = 1 # train with quantization layer
+        # print(f"-> sigma: {csinet_quant.quant.sigma}")
         print(f"-> centers: {csinet_quant.quant.c}")
 
-        del enc_train_ldr, enc_valid_ldr
+        # profile_network(csinet_quant,
+        #                 train_ldr,
+        #                 valid_ldr,
+        #                 batch_num,
+        #                 epochs=epochs,
+        #                 json_config=json_config,
+        #                 quant_bool=True
+        #                )
 
         model, checkpoint, history, optimizer, timers = fit(csinet_quant,
                                                             train_ldr,
@@ -304,7 +351,8 @@ if __name__ == "__main__":
                                                             json_config=json_config,
                                                             debug_flag=opt.debug_flag,
                                                             pickle_dir=pickle_dir,
-                                                            network_name=network_name)
+                                                            network_name=network_name,
+                                                            quant_bool=True)
 
         [checkpoint, y_hat, y_test] = score(csinet_quant,
                                             all_ldr,
