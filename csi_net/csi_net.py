@@ -70,7 +70,7 @@ class Decoder(torch.nn.Module):
 
 class CsiNetQuant(nn.Module):
     """ CsiNet-Quant for csi estimation with entropy-based loss term """
-    def __init__(self, encoder, decoder, quant, latent_dim, device=None):
+    def __init__(self, encoder, decoder, quant, latent_dim, device=None, hard_sigma=1e6):
         super(CsiNetQuant, self).__init__()
         self.encoder = encoder
         self.decoder = decoder
@@ -80,6 +80,16 @@ class CsiNetQuant(nn.Module):
         self.quant_bool = True
         self.training = True
         self.p_hist = torch.zeros(self.quant.L).to(self.device) # histogram estimate of probabilities
+        # vals for annealing sigma
+
+        # self.hard_sigma = OrderedDict({'sigma': torch.Tensor([hard_sigma]).to(device)})
+        # self.hard_sigma = torch.Tensor([hard_sigma]).to(device)
+        # self.hard_sigma = torch.nn.Parameter(torch.Tensor([hard_sigma]).to(device), requires_grad=False)
+        self.hard_sigma = hard_sigma
+
+        self.T_sigma = 11719 # timescale of annealing (batches)
+        self.K_sigma = 100 # gain of annealing
+        self.t = 0 # index of current iteration for annealing
         # self.p_hard = torch.zeros(b,self.quant.n_features,self.quant.L).to(self.device)
 
     def forward(self, H_in):
@@ -88,33 +98,67 @@ class CsiNetQuant(nn.Module):
         return self.decoder(self.quant(h_enc)) if self.quant_bool else self.decoder(h_enc)
 
     def crossentropy_loss(self, H_in, clip_val=1e-9):
-        """ calculate """
-        # temporarily store current quant_bool, sigma values
-        # self.p_hist = [0]*self.quant.L # init histogram estimate of probabilities
+        """ calculate crossentropy between soft/hard assignment probas """
+        # temporarily store current quant_bool
         quant_mode_temp = self.quant.quant_mode
-        # sigma_temp = self.quant.state_dict()["sigma"][:]
-        # print(f"--- sigma_temp: {sigma_temp} ---")
         self.quant.quant_mode = 2 # get softmax outputs
-        # self.quant.load_state_dict(OrderedDict({"sigma": torch.Tensor([1e4])}), strict=False) # large value of sigma -> hard quantization
         q_soft = self.quant(self.encoder(H_in))
         b = q_soft.shape[0]
-        # print(f'--- q_soft.shape={q_soft.shape} ---')
         H_idx = torch.argmax(q_soft, dim=2)
-        # print(f'--- H_idx.shape={H_idx.shape} ---')
         for val in range(self.quant.L):
             num_val = torch.sum(H_idx == val)
             self.p_hist[val] = torch.true_divide(num_val, self.quant.n_features*b)
         p_hard = self.p_hist.view(1,1,self.quant.L).repeat(b,self.quant.n_features,1)
         p_hard = torch.clamp(p_hard, clip_val, 1.0)
-        # print(f"--- p_hard: {p_hard} ---")
         # store back original quant_mode, sigma values
         self.quant.quant_mode = quant_mode_temp
-        # self.quant.load_state_dict(OrderedDict({"sigma": sigma_temp}), strict=False) # large value of sigma -> hard quantization
         entropy_loss = -torch.sum(q_soft * torch.log2(p_hard)) / (self.quant.n_features*b)
         return entropy_loss
+    
+    def calc_gap(self, mse_soft, H_hat_soft, H_in, hard_sigma=1e6, criterion=nn.MSELoss()):
+        """
+        running total of gap between soft/hard crossentropy
+        H_hat_soft : soft quantization estimate from outer loop
+        H_in : autoencoder input
+        """
+        # mse_soft = torch.mean(torch.pow(H_hat_soft - H_in, 2)) # assume we can pass this in
+        # make sigma large -> hard quantization
+
+        # sigma_temp = OrderedDict({'sigma': self.quant.state_dict()['sigma']})
+        # sigma_temp = self.quant.sigma.data
+        # sigma_temp = torch.nn.Parameter(self.quant.sigma.data, requires_grad=False)
+        sigma_temp = self.quant.sigma
+
+        # self.quant.load_state_dict(self.hard_sigma, strict=False)
+        # self.quant.sigma.data = self.hard_sigma.data
+        self.quant.sigma = self.hard_sigma
+
+        H_hat_hard = self.forward(H_in)
+        mse_hard = criterion(H_hat_hard, H_in)
+
+        # self.quant.load_state_dict(sigma_temp, strict=False)
+        # self.quant.sigma.data = sigma_temp
+        self.quant.sigma = sigma_temp
+
+        return mse_soft - mse_hard
+
+    def update_gap(self, mse_soft, H_hat_soft, H_in, hard_sigma=1e6, criterion=nn.MSELoss()):
+        self.gap_t = self.calc_gap(mse_soft, H_hat_soft, H_in, hard_sigma=hard_sigma, criterion=criterion)
+        if self.t == 0:
+            self.gap_0 = self.gap_t
+
+    def anneal_sigma(self):
+        self.e_g = self.gap_t + self.T_sigma / (self.T_sigma + self.t) * self.gap_0
+# 
+        # self.quant.load_state_dict(OrderedDict({'sigma':torch.add(self.quant.sigma,+ self.K_sigma*self.gap_t)}), strict=False)
+        # self.quant.sigma.data += self.K_sigma*self.gap_t
+        # self.quant.sigma = torch.nn.Parameter(torch.Tensor([self.quant.sigma.data + self.K_sigma*self.gap_t]).to(device), requires_grad=False)
+        self.quant.sigma += self.K_sigma*self.gap_t
+
+        self.t += 1
 
 class SoftQuantize(torch.nn.Module):
-    def __init__(self, r, L, m, sigma=0.1):
+    def __init__(self, r, L, m, sigma=0.1, sigma_trainable=True):
         """
         Soft quantization layer based on Voronoi tesselation centers
         sigma = temperature for softmax
@@ -123,7 +167,7 @@ class SoftQuantize(torch.nn.Module):
         m = dimensionality of cluster centers
         """
         super(SoftQuantize, self).__init__()
-        self.sigma = torch.nn.Parameter(data=torch.Tensor([sigma]), requires_grad=True)
+        self.sigma = torch.nn.Parameter(data=torch.Tensor([sigma]), requires_grad=True) if sigma_trainable else sigma
         self.r = r
         self.L = L # num centers
         self.m = m # dim of centers
@@ -217,7 +261,7 @@ if __name__ == "__main__":
     elif opt.data_type == "norm_sphH4":
         json_config = "../config/csinet-pro-indoor0001-sph.json" if opt.env == "indoor" else "../config/csinet-pro-outdoor300-sph-pow.json"
         # json_config = "../config/csinet-pro-quadriga-indoor0001-sph.json" if opt.env == "indoor" else "../config/csinet-pro-quadriga-outdoor300-sph.json"
-    dataset_spec, minmax_file, img_channels, data_format, norm_range, T, network_name, base_pickle, n_delay, total_num_files, t1_power_file, subsample_prop, thresh_idx_path, diff_spec = get_keys_from_json(json_config, keys=["dataset_spec", "minmax_file", "img_channels", "data_format", "norm_range", "T", "network_name", "base_pickle", "n_delay", "total_num_files", "t1_power_file", "subsample_prop", "thresh_idx_path", "diff_spec"])
+    dataset_spec, minmax_file, img_channels, data_format, norm_range, T, network_name, base_pickle, n_delay, total_num_files, t1_power_file, subsample_prop, thresh_idx_path, diff_spec, init_sigma = get_keys_from_json(json_config, keys=["dataset_spec", "minmax_file", "img_channels", "data_format", "norm_range", "T", "network_name", "base_pickle", "n_delay", "total_num_files", "t1_power_file", "subsample_prop", "thresh_idx_path", "diff_spec", "init_sigma"])
     # aux_bool_list = get_keys_from_json(json_config, keys=["aux_bool"], is_bool=True)
 
     input_dim = (2,32,n_delay)
@@ -326,11 +370,19 @@ if __name__ == "__main__":
         else:
             print(f"--- Loading pretrained state_dict files for CsiNet-Quant --- ")
             csinet_quant.quant.init_centers(torch.zeros(csinet_quant.quant.L, csinet_quant.quant.m).to(device))
-            csinet_quant.load_state_dict(torch.load(f"{pickle_dir}/{network_name}-pretrain-best-model.pt"), strict=False)
             csinet_quant.quant.load_state_dict(torch.load(f"{pickle_dir}/soft-quant-best-model.pt"))
+            csinet_quant.load_state_dict(torch.load(f"{pickle_dir}/{network_name}-pretrain-best-model.pt"), strict=False)
+
+        encoder = csinet_quant.encoder
+        decoder = csinet_quant.decoder
+        quant = SoftQuantize(cr, opt.num_centers, opt.dim_centers, sigma=csinet_quant.quant.sigma.item(), sigma_trainable=False)
+
+        quant.init_centers(csinet_quant.quant.c.data)
+        # quant.load_state_dict(OrderedDict({'c': }))
+        csinet_quant = CsiNetQuant(encoder, decoder, quant, cr, device=device).to(device) # remake network with non-trainable sigma
 
         csinet_quant.quant.quant_mode = 1 # train with quantization layer
-        # print(f"-> sigma: {csinet_quant.quant.sigma}")
+        print(f"-> sigma: {csinet_quant.quant.sigma}")
         print(f"-> centers: {csinet_quant.quant.c}")
 
         # profile_network(csinet_quant,
