@@ -88,7 +88,7 @@ class CsiNetQuant(nn.Module):
         self.hard_sigma = hard_sigma
 
         self.T_sigma = 11719 # timescale of annealing (batches)
-        self.K_sigma = 100 # gain of annealing
+        self.K_sigma = 10 # gain of annealing
         self.t = 0 # index of current iteration for annealing
         # self.p_hard = torch.zeros(b,self.quant.n_features,self.quant.L).to(self.device)
 
@@ -153,12 +153,15 @@ class CsiNetQuant(nn.Module):
         # self.quant.load_state_dict(OrderedDict({'sigma':torch.add(self.quant.sigma,+ self.K_sigma*self.gap_t)}), strict=False)
         # self.quant.sigma.data += self.K_sigma*self.gap_t
         # self.quant.sigma = torch.nn.Parameter(torch.Tensor([self.quant.sigma.data + self.K_sigma*self.gap_t]).to(device), requires_grad=False)
+        print(f"--- anneal_sigma pre-update - sigma={self.quant.sigma} ---")
         self.quant.sigma += self.K_sigma*self.gap_t
+        self.quant.sigma = np.max([self.quant.sigma_eps, self.quant.sigma])
+        print(f"--- anneal_sigma post-update - sigma={self.quant.sigma} ---")
 
         self.t += 1
 
 class SoftQuantize(torch.nn.Module):
-    def __init__(self, r, L, m, sigma=0.1, sigma_trainable=True):
+    def __init__(self, r, L, m, sigma=5, sigma_trainable=True):
         """
         Soft quantization layer based on Voronoi tesselation centers
         sigma = temperature for softmax
@@ -167,12 +170,14 @@ class SoftQuantize(torch.nn.Module):
         m = dimensionality of cluster centers
         """
         super(SoftQuantize, self).__init__()
+        self.sigma_trainable = sigma_trainable
         self.sigma = torch.nn.Parameter(data=torch.Tensor([sigma]), requires_grad=True) if sigma_trainable else sigma
         self.r = r
         self.L = L # num centers
         self.m = m # dim of centers
         self.n_features = int(r/m)
         self.softmax = nn.Softmax(dim=2)
+        self.sigma_eps = 1e-4
         self.quant_mode = 0 # 0 = pass through (no quantization), 1 = soft quantization, 2 = return softmax outputs
         
     def init_centers(self, c):
@@ -189,7 +194,9 @@ class SoftQuantize(torch.nn.Module):
         else:
             z = x.view(b, self.n_features, self.m, 1).repeat(1, 1, 1, self.L)
             c = self.c.view(1,1,self.m,self.L).repeat(b, self.n_features, 1, 1)
-            q = self.softmax(-self.sigma*torch.sum(torch.pow(z - c, 2), 2))
+            sigma = self.sigma.relu() + self.sigma_eps if self.sigma_trainable else self.sigma
+            # print(f"--- sigma: {sigma} ---")
+            q = self.softmax(-sigma*torch.sum(torch.pow(z - c, 2), 2))
             c = self.c.view(1,self.m,self.L).repeat(b,1,1).transpose(2,1)
             out = torch.matmul(q, c)
             if self.quant_mode == 1:
@@ -304,7 +311,7 @@ if __name__ == "__main__":
 
         encoder = Encoder(input_dim[0], input_dim[1], opt.n_truncate, cr)
         decoder = Decoder(input_dim[0], input_dim[1], opt.n_truncate, cr)
-        quant = SoftQuantize(cr, opt.num_centers, opt.dim_centers, sigma=0.1)
+        quant = SoftQuantize(cr, opt.num_centers, opt.dim_centers, sigma_trainable=False)
         csinet_quant = CsiNetQuant(encoder, decoder, quant, cr, device=device).to(device)
 
         pickle_dir = f"{base_pickle}/cr{cr}/t1"
@@ -338,44 +345,44 @@ if __name__ == "__main__":
                                                 n_train=data_train.shape[0],
                                                 pow_diff_t=pow_diff
                                                 )
-
             if not opt.debug_flag:                
                 save_checkpoint_history(checkpoint, history, optimizer, dir=pickle_dir, network_name=f"{network_name}-pretrain")
 
-            # use encoder to get train/validation codewords
-            with torch.no_grad():
-                enc_train = csinet_quant.encoder(torch.from_numpy(data_train).to(device))
-                enc_valid = csinet_quant.encoder(torch.from_numpy(data_val).to(device))
-            enc_train_ldr = torch.utils.data.DataLoader(enc_train, batch_size=batch_size, shuffle=True)
-            enc_valid_ldr = torch.utils.data.DataLoader(enc_valid, batch_size=batch_size)
-            c = np.random.randint(enc_train.shape[0], size=opt.num_centers)
-            sampled_centers = enc_train.view(enc_train.shape[0]*int(opt.rate / opt.dim_centers), opt.dim_centers)[c,:]
-            print(f"--- sampled_centers.shape: {sampled_centers.shape} ---")
-            csinet_quant.quant.init_centers(sampled_centers)
-
-            fit(csinet_quant.quant,
-                enc_train_ldr,
-                enc_valid_ldr,
-                batch_num,
-                epochs=epochs,
-                timers=timers,
-                criterion=energy_loss,
-                json_config=json_config,
-                debug_flag=opt.debug_flag,
-                pickle_dir=pickle_dir,
-                network_name="soft-quant")
-
-            del enc_train_ldr, enc_valid_ldr
-
         else:
             print(f"--- Loading pretrained state_dict files for CsiNet-Quant --- ")
-            csinet_quant.quant.init_centers(torch.zeros(csinet_quant.quant.L, csinet_quant.quant.m).to(device))
-            csinet_quant.quant.load_state_dict(torch.load(f"{pickle_dir}/soft-quant-best-model.pt"))
+            # csinet_quant.quant.init_centers(torch.zeros(csinet_quant.quant.L, csinet_quant.quant.m).to(device))
+            # csinet_quant.quant.load_state_dict(torch.load(f"{pickle_dir}/soft-quant-best-model.pt"))
             csinet_quant.load_state_dict(torch.load(f"{pickle_dir}/{network_name}-pretrain-best-model.pt"), strict=False)
+
+        # use encoder to get train/validation codewords
+        with torch.no_grad():
+            enc_train = csinet_quant.encoder(torch.from_numpy(data_train).to(device))
+            enc_valid = csinet_quant.encoder(torch.from_numpy(data_val).to(device))
+        enc_train_ldr = torch.utils.data.DataLoader(enc_train, batch_size=batch_size, shuffle=True)
+        enc_valid_ldr = torch.utils.data.DataLoader(enc_valid, batch_size=batch_size)
+        c = np.random.randint(enc_train.shape[0], size=opt.num_centers)
+        sampled_centers = enc_train.view(enc_train.shape[0]*int(opt.rate / opt.dim_centers), opt.dim_centers)[c,:]
+        print(f"--- sampled_centers.shape: {sampled_centers.shape} ---")
+        csinet_quant.quant.init_centers(sampled_centers)
+
+        fit(csinet_quant.quant,
+            enc_train_ldr,
+            enc_valid_ldr,
+            batch_num,
+            epochs=epochs,
+            timers=timers,
+            criterion=energy_loss,
+            json_config=json_config,
+            debug_flag=opt.debug_flag,
+            pickle_dir=pickle_dir,
+            network_name="soft-quant")
+
+        del enc_train_ldr, enc_valid_ldr
 
         encoder = csinet_quant.encoder
         decoder = csinet_quant.decoder
-        quant = SoftQuantize(cr, opt.num_centers, opt.dim_centers, sigma=csinet_quant.quant.sigma.item(), sigma_trainable=False)
+        # sigma = csinet_quant.quant.sigma.relu().item() + csinet_quant.quant.sigma_eps
+        quant = SoftQuantize(cr, opt.num_centers, opt.dim_centers, sigma=csinet_quant.quant.sigma, sigma_trainable=False)
 
         quant.init_centers(csinet_quant.quant.c.data)
         # quant.load_state_dict(OrderedDict({'c': }))
