@@ -81,13 +81,13 @@ class CsiNetQuant(nn.Module):
         self.training = True
         self.p_hist = torch.zeros(self.quant.L).to(self.device) # histogram estimate of probabilities
         self.p_mask = torch.arange(self.quant.L).reshape(1,self.quant.L,1).repeat(batch_size,1,self.quant.n_features).to(self.device)
+        # self.p_hard = torch.zeros(batch_size,self.quant.L,self.quant.n_features).to(self.device) # to save on inference time, we will store forward passes with hard quantization here
 
         # vals for annealing sigma
-
         self.hard_sigma = hard_sigma
 
         self.T_sigma = 11719 # timescale of annealing (batches)
-        self.K_sigma = 10 # gain of annealing
+        self.K_sigma = .1 # gain of annealing
         self.t = 0 # index of current iteration for annealing
 
     def forward(self, H_in):
@@ -128,11 +128,15 @@ class CsiNetQuant(nn.Module):
         # make sigma large -> hard quantization
         sigma_temp = self.quant.sigma
 
-        self.quant.sigma = self.hard_sigma
+        # self.quant.sigma = self.hard_sigma
+        quant_mode_temp = self.quant.quant_mode
+        self.quant.quant_mode = 3
 
         H_hat_hard = self.forward(H_in)
         mse_hard = criterion(H_hat_hard, H_in)
-        self.quant.sigma = sigma_temp
+
+        # self.quant.sigma = sigma_temp
+        self.quant.quant_mode = quant_mode_temp
 
         return mse_hard - mse_soft
 
@@ -149,7 +153,7 @@ class CsiNetQuant(nn.Module):
         self.t += 1
 
 class SoftQuantize(torch.nn.Module):
-    def __init__(self, r, L, m, sigma=1.0, sigma_trainable=True):
+    def __init__(self, r, L, m, sigma=1.0, sigma_trainable=True, bs=200, device="cpu"):
         """
         Soft quantization layer based on Voronoi tesselation centers
         sigma = temperature for softmax
@@ -167,6 +171,7 @@ class SoftQuantize(torch.nn.Module):
         self.softmax = nn.Softmax(dim=2)
         self.sigma_eps = 1e-4
         self.quant_mode = 0 # 0 = pass through (no quantization), 1 = soft quantization, 2 = return softmax outputs
+        self.q_hot_template = torch.zeros(bs, self.n_features, self.L).to(device)
         
     def init_centers(self, c):
         self.c = torch.nn.Parameter(data=c, requires_grad=True)
@@ -185,12 +190,15 @@ class SoftQuantize(torch.nn.Module):
             sigma = self.sigma.relu() + self.sigma_eps if self.sigma_trainable else self.sigma
             # print(f"--- sigma: {sigma} ---")
             q = self.softmax(-sigma*torch.sum(torch.pow(z - c, 2), 2))
+            if self.quant_mode == 2:
+                return q # softmax outputs
+            elif self.quant_mode == 3: # hard quantization
+                q_max = torch.argmax(q, dim=2).view(b,self.n_features,1)
+                q = self.q_hot_template.scatter_(2, q_max, 1)
             c = self.c.view(1,self.m,self.L).repeat(b,1,1).transpose(2,1)
             out = torch.matmul(q, c)
-            if self.quant_mode == 1:
-                return out.view(b, self.r) # soft quantized outputs
-            elif self.quant_mode == 2:
-                return q # softmax outputs
+            return out.view(b, self.r) # soft quantized outputs
+
 
 def energy_loss(y_gt, y_hat):
     return torch.mean(torch.sum(torch.pow(y_gt - y_hat, 2), dim=1))
@@ -232,9 +240,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-d", "--debug_flag", type=int, default=0, help="flag for toggling debugging mode")
     parser.add_argument("-g", "--gpu_num", type=int, default=0, help="number for torch device (cuda:gpu_num)")
-    parser.add_argument("-p1", "--pretrain1_bool", type=str2bool, default=True, help="bool for performing pretrain stage 1 (autoencoder with no latent quantization)")
+    parser.add_argument("-p1", "--pretrain1_bool", type=str2bool, default=False, help="bool for performing pretrain stage 1 (autoencoder with no latent quantization)")
     parser.add_argument("-p2", "--pretrain2_bool", type=str2bool, default=True, help="bool for performing pretrain stage 2 (training initial centers)")
-    parser.add_argument("-tr", "--train_bool", type=str2bool, default=True, help="flag for toggling training for last stage (soft-to-hard vector quantization)")
+    parser.add_argument("-tr", "--train_bool", type=str2bool, default=True, help="flag for toggling training for soft-to-hard vector quantization")
+    parser.add_argument("-th", "--train_hard_bool", type=str2bool, default=True, help="flag for fine-tuning training on hard vector quantization)")
     parser.add_argument("-b", "--n_batch", type=int, default=20, help="number of batches to fit on (ignored during debug mode)")
     parser.add_argument("-l", "--dir", type=str, default=None, help="subdirectory for saving model, checkpoint, history")
     parser.add_argument("-e", "--env", type=str, default="indoor", help="environment (either indoor or outdoor)")
@@ -261,7 +270,7 @@ if __name__ == "__main__":
     # aux_bool_list = get_keys_from_json(json_config, keys=["aux_bool"], is_bool=True)
 
     input_dim = (2,32,n_delay)
-    epochs = 10 if opt.debug_flag else opt.epochs
+    epochs = 1 if opt.debug_flag else opt.epochs
 
     batch_num = 1 if opt.debug_flag else opt.n_batch # dataset batches
     M_1 = None # legacy holdover from CsiNet-LSTM
@@ -273,7 +282,7 @@ if __name__ == "__main__":
 
     # load all data splits
     # data_train, data_val, data_test = dataset_pipeline(batch_num, opt.debug_flag, aux_bool, dataset_spec, M_1, T = T, img_channels = img_channels, img_height = input_dim[1], img_width = input_dim[2], data_format = data_format, idx_split=opt.split, n_truncate=opt.n_truncate, total_num_files=total_num_files+1)
-    pow_diff, data_train, data_val = dataset_pipeline_col(opt.debug_flag, aux_bool, dataset_spec, diff_spec, aux_size, T = T, img_channels = input_dim[0], img_height = input_dim[1], img_width = input_dim[2], data_format = data_format, train_bool = opt.train_bool, subsample_prop=subsample_prop, thresh_idx_path=thresh_idx_path)
+    pow_diff, data_train, data_val = dataset_pipeline_col(opt.debug_flag, aux_bool, dataset_spec, diff_spec, aux_size, T = T, img_channels = input_dim[0], img_height = input_dim[1], img_width = input_dim[2], data_format = data_format, train_argv = True, subsample_prop=subsample_prop, thresh_idx_path=thresh_idx_path)
 
     # handle renorm data
     print('-> pre-renorm: data_val range is from {} to {} -- data_val.shape = {}'.format(np.min(data_val),np.max(data_val),data_val.shape))
@@ -294,13 +303,13 @@ if __name__ == "__main__":
     # cr_list = [512, 256, 128, 64, 32] # rates for different compression ratios
     cr_list = [opt.rate]
     for cr in cr_list:
-        train_ldr = torch.utils.data.DataLoader(torch.from_numpy(data_train).to(device), batch_size=batch_size, shuffle=True) if opt.train_bool else None
+        train_ldr = torch.utils.data.DataLoader(torch.from_numpy(data_train).to(device), batch_size=batch_size, shuffle=True) 
         valid_ldr = torch.utils.data.DataLoader(torch.from_numpy(data_val).to(device), batch_size=batch_size)
         all_ldr = torch.utils.data.DataLoader(torch.from_numpy(data_all).to(device), batch_size=batch_size)
 
         encoder = Encoder(input_dim[0], input_dim[1], opt.n_truncate, cr)
         decoder = Decoder(input_dim[0], input_dim[1], opt.n_truncate, cr)
-        quant = SoftQuantize(cr, opt.num_centers, opt.dim_centers, sigma_trainable=False)
+        quant = SoftQuantize(cr, opt.num_centers, opt.dim_centers, sigma_trainable=False, device=device)
         csinet_quant = CsiNetQuant(encoder, decoder, quant, cr, device=device).to(device)
 
         pickle_dir = f"{base_pickle}/cr{cr}/t1"
@@ -319,6 +328,18 @@ if __name__ == "__main__":
                                                                 network_name=f"{network_name}-pretrain")
         else:
             csinet_quant.load_state_dict(torch.load(f"{pickle_dir}/{network_name}-pretrain-best-model.pt"), strict=False)
+            strs = ["checkpoint", "history"]
+            load_dict = {}
+            for str_i in strs:
+                with open(f"{pickle_dir}/{network_name}-pretrain-{str_i}.pkl", "rb") as f:
+                    load_dict[str_i] = pickle.load(f)
+                    f.close()
+            checkpoint, history, = load_dict["checkpoint"], load_dict["history"]
+            # optim_state_dict = torch.load(f"{pickle_dir}/{network_name}-pretrain-optimizer.pt")
+            # for key, val in optim_state_dict.items():
+            #     # print(f"{key}: {val.shape}")
+            #     print(f"{key}: {type(val)}")
+            optimizer = optim.Adam(csinet_quant.parameters(), lr=learning_rate)
 
         [checkpoint, y_hat, y_test] = score(csinet_quant,
                                             all_ldr,
@@ -336,6 +357,8 @@ if __name__ == "__main__":
                                             )
         if not opt.debug_flag:                
             save_checkpoint_history(checkpoint, history, optimizer, dir=pickle_dir, network_name=f"{network_name}-pretrain")
+        
+        del train_ldr, valid_ldr, all_ldr
 
         if opt.pretrain2_bool:
             # use encoder to get train/validation codewords
@@ -363,15 +386,15 @@ if __name__ == "__main__":
 
             del enc_train_ldr, enc_valid_ldr
         else:
-            print(f"--- Loading pretrained state_dict files for CsiNet-Quant --- ")
-            # csinet_quant.quant.init_centers(torch.zeros(csinet_quant.quant.L, csinet_quant.quant.m).to(device))
-            # csinet_quant.quant.load_state_dict(torch.load(f"{pickle_dir}/soft-quant-best-model.pt"))
-            csinet_quant.load_state_dict(torch.load(f"{pickle_dir}/{network_name}-pretrain-best-model.pt"), strict=False)
+            print(f"--- Loading pretrained SoftQuant layer --- ")
+            csinet_quant.quant.init_centers(torch.zeros(csinet_quant.quant.L, csinet_quant.quant.m).to(device))
+            csinet_quant.quant.load_state_dict(torch.load(f"{pickle_dir}/soft-quant-best-model.pt"))
+            # csinet_quant.quant.load_state_dict(torch.load(f"{pickle_dir}/{network_name}-soft-quant-model.pt"), strict=False)
 
         encoder = csinet_quant.encoder
         decoder = csinet_quant.decoder
         # sigma = csinet_quant.quant.sigma.relu().item() + csinet_quant.quant.sigma_eps
-        quant = SoftQuantize(cr, opt.num_centers, opt.dim_centers, sigma=csinet_quant.quant.sigma, sigma_trainable=False)
+        quant = SoftQuantize(cr, opt.num_centers, opt.dim_centers, sigma=csinet_quant.quant.sigma, sigma_trainable=False, device=device)
 
         quant.init_centers(csinet_quant.quant.c.data)
         # quant.load_state_dict(OrderedDict({'c': }))
@@ -390,6 +413,10 @@ if __name__ == "__main__":
         #                 quant_bool=True
         #                )
 
+        train_ldr = torch.utils.data.DataLoader(torch.from_numpy(data_train).to(device), batch_size=batch_size, shuffle=True) 
+        valid_ldr = torch.utils.data.DataLoader(torch.from_numpy(data_val).to(device), batch_size=batch_size)
+        # all_ldr = torch.utils.data.DataLoader(torch.from_numpy(data_all).to(device), batch_size=batch_size)
+
         if opt.train_bool:
             model, checkpoint, history, optimizer, timers = fit(csinet_quant,
                                                                 train_ldr,
@@ -401,10 +428,23 @@ if __name__ == "__main__":
                                                                 debug_flag=opt.debug_flag,
                                                                 pickle_dir=pickle_dir,
                                                                 network_name=network_name,
-                                                                quant_bool=True)
+                                                                quant_bool=True,
+                                                                anneal_bool=True)
+            csinet_quant.quant.sigma = checkpoint["best_sigma"]
+            csinet_quant.load_state_dict(checkpoint["best_model"])
         else:
-            csinet_quant.load_state_dict(torch.load(f"{pickle_dir}/{network_name}-best-model.pt"), strict=False)
+            model_weights_name = f"{pickle_dir}/{network_name}-best-model.pt"
+            print(f"---- Loading best model from {model_weights_name} ---")
+            csinet_quant.load_state_dict(torch.load(model_weights_name))
+            csinet_quant.quant.quant_mode = 1 # train with quantization layer
+            checkpoint_name = f"{pickle_dir}/{network_name}-checkpoint.pkl"
+            with open(checkpoint_name, 'rb') as f:
+                checkpoint = pickle.load(f)
+                f.close()
+            csinet_quant.quant.sigma = checkpoint["best_sigma"]
 
+        del train_ldr, valid_ldr
+        all_ldr = torch.utils.data.DataLoader(torch.from_numpy(data_all).to(device), batch_size=batch_size)
         [checkpoint, y_hat, y_test] = score(csinet_quant,
                                             all_ldr,
                                             data_all,
@@ -415,10 +455,56 @@ if __name__ == "__main__":
                                             timers=timers,
                                             json_config=json_config,
                                             debug_flag=opt.debug_flag,
-                                            str_mod=f"CsiNetQuant CR={cr} (latent quantization)",
+                                            str_mod=f"CsiNetQuant CR={cr} (best soft-quantization with sigma={checkpoint['best_sigma']})",
                                             n_train=data_train.shape[0],
                                             pow_diff_t=pow_diff
                                             )
 
         if not opt.debug_flag:                
             save_checkpoint_history(checkpoint, history, optimizer, dir=pickle_dir, network_name=network_name)
+
+        del all_ldr
+        train_ldr = torch.utils.data.DataLoader(torch.from_numpy(data_train).to(device), batch_size=batch_size, shuffle=True) 
+        valid_ldr = torch.utils.data.DataLoader(torch.from_numpy(data_val).to(device), batch_size=batch_size)
+
+        csinet_quant.quant.quant_mode = 3
+        if opt.train_hard_bool:
+            model, checkpoint, history, optimizer, timers = fit(csinet_quant,
+                                                                train_ldr,
+                                                                valid_ldr,
+                                                                batch_num,
+                                                                epochs=epochs,
+                                                                timers=timers,
+                                                                json_config=json_config,
+                                                                debug_flag=opt.debug_flag,
+                                                                pickle_dir=pickle_dir,
+                                                                network_name=f"{network_name}-hard",
+                                                                quant_bool=True,
+                                                                anneal_bool=False)
+        # else:
+        #     model_weights_name = f"{pickle_dir}/{network_name}-best-model-hard.pt"
+        #     print(f"---- Loading best hard quantized model from {model_weights_name} ---")
+        #     csinet_quant.load_state_dict(torch.load(model_weights_name))
+
+        del train_ldr, valid_ldr
+        all_ldr = torch.utils.data.DataLoader(torch.from_numpy(data_all).to(device), batch_size=batch_size)
+        [checkpoint, y_hat, y_test] = score(csinet_quant,
+                                            all_ldr,
+                                            data_all,
+                                            batch_num,
+                                            checkpoint,
+                                            history,
+                                            optimizer,
+                                            timers=timers,
+                                            json_config=json_config,
+                                            debug_flag=opt.debug_flag,
+                                            str_mod=f"CsiNetQuant CR={cr} (hard quantization)",
+                                            n_train=data_train.shape[0],
+                                            pow_diff_t=pow_diff,
+                                            key_mod="_hard"
+                                            )
+
+        # if not opt.debug_flag:                
+        #     save_checkpoint_history(checkpoint, history, optimizer, dir=pickle_dir, network_name=f"{network_name}-hard")
+
+        del all_ldr

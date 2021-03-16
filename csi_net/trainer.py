@@ -12,7 +12,7 @@ from utils.NMSE_performance import get_NMSE, denorm_H3, denorm_H4, denorm_sphH4
 from utils.data_tools import dataset_pipeline, subsample_batches, split_complex, load_pow_diff
 from utils.unpack_json import get_keys_from_json
 
-def fit(model, train_ldr, valid_ldr, batch_num, schedule=None, criterion=nn.MSELoss(), epochs=10, timers=None, json_config=None, debug_flag=True, pickle_dir=".", input_type="split", patience=1000, network_name=None, quant_bool=False):
+def fit(model, train_ldr, valid_ldr, batch_num, schedule=None, criterion=nn.MSELoss(), epochs=10, timers=None, json_config=None, debug_flag=True, pickle_dir=".", input_type="split", patience=1000, network_name=None, quant_bool=False, anneal_bool=False, l2_weight=1e-12):
     # pull out timers
     fit_timer = timers["fit_timer"] 
 
@@ -25,7 +25,7 @@ def fit(model, train_ldr, valid_ldr, batch_num, schedule=None, criterion=nn.MSEL
     lr = lr / 10 if quant_bool else lr
     beta, const_sigma = get_keys_from_json(json_config, keys=['beta', 'const_sigma'])
 
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=l2_weight)
     # TODO: Load in epoch
     checkpoint = {
                     "latest_model": None,
@@ -42,12 +42,15 @@ def fit(model, train_ldr, valid_ldr, batch_num, schedule=None, criterion=nn.MSEL
                     "test_loss": np.zeros(epochs)
                 }
     if quant_bool:
+        checkpoint["best_sigma"] = model.quant.sigma # init best_sigma
         history["train_mse"] = np.zeros(epochs)
         history["train_entropy"] = np.zeros(epochs)
-        history["train_gap"] = np.zeros(epochs)
         history["test_mse"] = np.zeros(epochs)
         history["test_entropy"] = np.zeros(epochs)
-        history["test_gap"] = np.zeros(epochs)
+        if anneal_bool:
+            history["train_gap"] = np.zeros(epochs)
+            history["test_gap"] = np.zeros(epochs)
+
 
     best_test_loss = None
     epochs_no_improvement = 0
@@ -87,14 +90,21 @@ def fit(model, train_ldr, valid_ldr, batch_num, schedule=None, criterion=nn.MSEL
                 train_loss += loss_i
                 loss_i.backward()
                 optimizer.step()
-                if quant_bool:
+                if quant_bool and anneal_bool:
                     with torch.no_grad():
                         model.update_gap(mse, dec, h_input)
                         model.anneal_sigma()
                     train_gap += model.gap_t
                 if (i != 0):
                     tqdm.write(f"\033[A                                                         \033[A")
-                tqdm_str = f"Epoch #{epoch+1}/{epochs}: Training loss: {mse.data:.5E}" if not quant_bool else f"Epoch #{epoch+1}/{epochs}: Training loss: {loss_i:.5E} - mse: {mse.data:.5E} - entropy: {entropy.data:.5E} - gap: {model.gap_t.data:.5E} - sigma: {model.quant.sigma:4.3E}"
+                # choose string based on quantization, annealing
+                if quant_bool:
+                    if anneal_bool:
+                        tqdm_str = f"Epoch #{epoch+1}/{epochs}: Training loss: {loss_i:.5E} - mse: {mse.data:.5E} - entropy: {entropy.data:.5E} - gap: {model.gap_t.data:.5E} - sigma: {model.quant.sigma:4.3E}"
+                    else:
+                        tqdm_str = f"Epoch #{epoch+1}/{epochs}: Training loss: {loss_i:.5E} - mse: {mse.data:.5E} - entropy: {entropy.data:.5E}"
+                else:
+                    tqdm_str = f"Epoch #{epoch+1}/{epochs}: Training loss: {mse.data:.5E}" 
                 tqdm.write(tqdm_str)
             # post training step, dump to checkpoint
             checkpoint["model"] = copy.deepcopy(model).to("cpu").state_dict()
@@ -104,7 +114,8 @@ def fit(model, train_ldr, valid_ldr, batch_num, schedule=None, criterion=nn.MSEL
             if quant_bool:
                 history["train_mse"][epoch] = train_mse.detach().to("cpu").numpy() / (i+1)
                 history["train_entropy"][epoch] = train_entropy.detach().to("cpu").numpy() / (i+1)
-                history["train_gap"][epoch] = train_gap.detach().to("cpu").numpy() / (i+1)
+                if anneal_bool:
+                    history["train_gap"][epoch] = train_gap.detach().to("cpu").numpy() / (i+1)
 
             # validation step
             # model.training = False # optionally check just the MSE performance during eval
@@ -133,7 +144,8 @@ def fit(model, train_ldr, valid_ldr, batch_num, schedule=None, criterion=nn.MSEL
                         test_entropy += entropy
                         test_mse += mse
                         loss_i = mse+beta*entropy
-                        test_gap += model.calc_gap(mse, dec, h_input)
+                        if anneal_bool:
+                            test_gap += model.calc_gap(mse, dec, h_input)
                     else:
                         loss_i = mse
                     test_loss += loss_i
@@ -141,13 +153,16 @@ def fit(model, train_ldr, valid_ldr, batch_num, schedule=None, criterion=nn.MSEL
                 if quant_bool:
                     history["test_mse"][epoch] = test_mse.detach().to("cpu").numpy() / (i+1)
                     history["test_entropy"][epoch] = test_entropy.detach().to("cpu").numpy() / (i+1)
-                    history["test_gap"][epoch] = test_gap.detach().to("cpu").numpy() / (i+1)
+                    if anneal_bool:
+                        history["test_gap"][epoch] = test_gap.detach().to("cpu").numpy() / (i+1)
                 # if epoch >= grace_period:
                 if type(best_test_loss) == type(None) or best_test_loss > history["test_loss"][epoch]:
                     best_test_loss = history["test_loss"][epoch]
                     checkpoint["best_epoch"] = epoch
                     checkpoint["best_model"] = copy.deepcopy(model).to("cpu").state_dict()
                     epochs_no_improvement = 0
+                    if quant_bool:
+                        checkpoint["best_sigma"] = model.quant.sigma
                     if not debug_flag:
                         torch.save(checkpoint["best_model"], f"{pickle_dir}/{network_name}-best-model.pt")
                     print(f"Epoch #{epoch+1}/{epochs}: Test loss: {history['test_loss'][epoch]:.5E} -- New best epoch: {epoch+1}")
@@ -156,20 +171,21 @@ def fit(model, train_ldr, valid_ldr, batch_num, schedule=None, criterion=nn.MSEL
                     print(f"Epoch #{epoch+1}/{epochs}: Test loss: {history['test_loss'][epoch]:.5E} -- Test loss did not improve. Best epoch: #{checkpoint['best_epoch']+1}")
                 else:
                     model.load_state_dict(checkpoint["best_model"])
-                    if not debug_flag:
-                        torch.save(checkpoint["best_model"], f"{pickle_dir}/{network_name}-best-model.pt")
+                    model.quant.sigma = checkpoint["best_sigma"]
                     print(f"Epoch #{epoch+1}/{epochs}: Test loss: {history['test_loss'][epoch]:.5E} -- Test loss did not improve for {patience} epochs. Loading best epoch #{checkpoint['best_epoch']+1}")
                     break
                 # else:
                 #     # don't track best epoch until grace period has expired
                 #     print(f"Epoch #{epoch+1}/{epochs}: Test loss: {history['test_loss'][epoch]:.5E}. Grace period is {grace_period} epochs.")
                 checkpoint["latest_model"] = copy.deepcopy(model).to("cpu").state_dict()
-                val_str = f"Epoch #{epoch+1}/{epochs}: Training loss: {history['train_loss'][epoch]:4.3E} -- Test loss: {history['test_loss'][epoch]:4.3E}" if not quant_bool else f"Epoch #{epoch+1}/{epochs}: Training (loss: {history['train_loss'][epoch]:4.3E} | mse: {history['train_mse'][epoch]:4.3E} | entropy: {history['train_entropy'][epoch]:4.3E} | gap: {history['train_gap'][epoch]:4.3E}) Test (loss: {history['test_loss'][epoch]:4.3E} | mse: {history['test_mse'][epoch]:4.3E} | entropy: {history['test_entropy'][epoch]:4.3E} | gap: {history['test_gap'][epoch]:4.3E})"
+                if quant_bool:
+                    if anneal_bool:
+                        val_str = f"Epoch #{epoch+1}/{epochs}: Training (loss: {history['train_loss'][epoch]:4.3E} | mse: {history['train_mse'][epoch]:4.3E} | entropy: {history['train_entropy'][epoch]:4.3E} | gap: {history['train_gap'][epoch]:4.3E}) Test (loss: {history['test_loss'][epoch]:4.3E} | mse: {history['test_mse'][epoch]:4.3E} | entropy: {history['test_entropy'][epoch]:4.3E} | gap: {history['test_gap'][epoch]:4.3E})"
+                    else:
+                        val_str = f"Epoch #{epoch+1}/{epochs}: Training (loss: {history['train_loss'][epoch]:4.3E} | mse: {history['train_mse'][epoch]:4.3E} | entropy: {history['train_entropy'][epoch]:4.3E}) Test (loss: {history['test_loss'][epoch]:4.3E} | mse: {history['test_mse'][epoch]:4.3E} | entropy: {history['test_entropy'][epoch]:4.3E})"
+                else:
+                    val_str = f"Epoch #{epoch+1}/{epochs}: Training loss: {history['train_loss'][epoch]:4.3E} -- Test loss: {history['test_loss'][epoch]:4.3E}"
                 tqdm.write(val_str)
-
-                if schedule != None:
-                    lr_scheduler.step()
-                    print(lr_scheduler.state_dict())
 
             # sigma on exponential schedule -- multiply by 1.001
             # if quant_bool:
@@ -177,7 +193,7 @@ def fit(model, train_ldr, valid_ldr, batch_num, schedule=None, criterion=nn.MSEL
 
     return [model, checkpoint, history, optimizer, timers]
 
-def score(model, valid_ldr, data_val, batch_num, checkpoint, history, optimizer, timeslot=0, err_dict=None, timers=None, json_config=None, debug_flag=True, str_mod="", torch_type=torch.float, n_train=0, pow_diff_t=None):
+def score(model, valid_ldr, data_val, batch_num, checkpoint, history, optimizer, timeslot=0, err_dict=None, timers=None, json_config=None, debug_flag=True, str_mod="", torch_type=torch.float, n_train=0, pow_diff_t=None, key_mod=""):
     """
     take model, predict on valid_ldr, score
     currently scores a spherically normalized dataset
@@ -244,21 +260,21 @@ def score(model, valid_ldr, data_val, batch_num, checkpoint, history, optimizer,
         print('-> post denorm: y_hat range is from {} to {}'.format(np.min(y_hat_denorm),np.max(y_hat_denorm)))
         print('-> post denorm: y_test range is from {} to {}'.format(np.min(y_test_denorm),np.max(y_test_denorm)))
         y_test_denorm, y_hat_denorm = y_test_denorm[n_train:,:,:,:], y_hat_denorm[n_train:,:,:,:]
-        print('-> post split: y_hat range is from {} to {}'.format(np.min(y_hat_denorm),np.max(y_hat_denorm)))
-        print('-> post split: y_test range is from {} to {}'.format(np.min(y_test_denorm),np.max(y_test_denorm)))
+        # print('-> post split: y_hat range is from {} to {}'.format(np.min(y_hat_denorm),np.max(y_hat_denorm)))
+        # print('-> post split: y_test range is from {} to {}'.format(np.min(y_test_denorm),np.max(y_test_denorm)))
         y_hat_denorm = y_hat_denorm[:,0,:,:] + 1j*y_hat_denorm[:,1,:,:]
         y_test_denorm = y_test_denorm[:,0,:,:] + 1j*y_test_denorm[:,1,:,:]
         y_shape = y_test_denorm.shape
         mse, nmse = get_NMSE(y_hat_denorm, y_test_denorm, return_mse=True, n_ang=y_shape[1], n_del=y_shape[2]) # one-step prediction -> estimate of single timeslot
         print(f"-> {str_mod} - truncate | NMSE = {nmse:5.3f} | MSE = {mse:.4E}")
-        checkpoint["best_nmse"] = nmse
-        checkpoint["best_mse"] = mse
+        checkpoint[f"best_nmse{key_mod}"] = nmse
+        checkpoint[f"best_mse{key_mod}"] = mse
 
         if type(pow_diff_t) != type(None): 
             mse, nmse = get_NMSE(y_hat_denorm, y_test_denorm, return_mse=True, n_ang=y_shape[1], n_del=y_shape[2], pow_diff_timeslot=pow_diff_t[n_train:]) # one-step prediction -> estimate of single timeslot
             print(f"-> {str_mod} - all | NMSE = {nmse:5.3f} | MSE = {mse:.4E}")
-            checkpoint["best_nmse_full"] = nmse
-            checkpoint["best_mse_full"] = mse
+            checkpoint[f"best_nmse_full{key_mod}"] = nmse
+            checkpoint[f"best_mse_full{key_mod}"] = mse
 
     return [checkpoint, y_hat, y_test]
 
