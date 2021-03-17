@@ -87,7 +87,7 @@ class CsiNetQuant(nn.Module):
         self.hard_sigma = hard_sigma
 
         self.T_sigma = 11719 # timescale of annealing (batches)
-        self.K_sigma = .1 # gain of annealing
+        self.K_sigma = 1 # gain of annealing
         self.t = 0 # index of current iteration for annealing
 
     def forward(self, H_in):
@@ -118,7 +118,7 @@ class CsiNetQuant(nn.Module):
         entropy_loss = -torch.sum(q_soft * torch.log2(p_hard)) / (self.quant.n_features*b)
         return entropy_loss
     
-    def calc_gap(self, mse_soft, H_hat_soft, H_in, hard_sigma=1e6, criterion=nn.MSELoss()):
+    def calc_gap(self, mse_soft, H_hat_soft, H_in, criterion=nn.MSELoss()):
         """
         running total of gap between soft/hard crossentropy
         H_hat_soft : soft quantization estimate from outer loop
@@ -128,20 +128,20 @@ class CsiNetQuant(nn.Module):
         # make sigma large -> hard quantization
         sigma_temp = self.quant.sigma
 
-        # self.quant.sigma = self.hard_sigma
-        quant_mode_temp = self.quant.quant_mode
-        self.quant.quant_mode = 3
+        self.quant.sigma = self.quant.hard_sigma
+        # quant_mode_temp = self.quant.quant_mode
+        # self.quant.quant_mode = 3
 
         H_hat_hard = self.forward(H_in)
         mse_hard = criterion(H_hat_hard, H_in)
 
-        # self.quant.sigma = sigma_temp
-        self.quant.quant_mode = quant_mode_temp
+        self.quant.sigma = sigma_temp
+        # self.quant.quant_mode = quant_mode_temp
 
         return mse_hard - mse_soft
 
-    def update_gap(self, mse_soft, H_hat_soft, H_in, hard_sigma=1e6, criterion=nn.MSELoss()):
-        self.gap_t = self.calc_gap(mse_soft, H_hat_soft, H_in, hard_sigma=hard_sigma, criterion=criterion)
+    def update_gap(self, mse_soft, H_hat_soft, H_in, criterion=nn.MSELoss()):
+        self.gap_t = self.calc_gap(mse_soft, H_hat_soft, H_in, criterion=criterion)
         if self.t == 0:
             self.gap_0 = self.gap_t
 
@@ -153,7 +153,7 @@ class CsiNetQuant(nn.Module):
         self.t += 1
 
 class SoftQuantize(torch.nn.Module):
-    def __init__(self, r, L, m, sigma=1.0, sigma_trainable=True, bs=200, device="cpu"):
+    def __init__(self, r, L, m, sigma=1.0, hard_sigma=1e6, sigma_trainable=True, bs=200, device="cpu"):
         """
         Soft quantization layer based on Voronoi tesselation centers
         sigma = temperature for softmax
@@ -164,6 +164,7 @@ class SoftQuantize(torch.nn.Module):
         super(SoftQuantize, self).__init__()
         self.sigma_trainable = sigma_trainable
         self.sigma = torch.nn.Parameter(data=torch.Tensor([sigma]), requires_grad=True) if sigma_trainable else sigma
+        self.hard_sigma = 1e6
         self.r = r
         self.L = L # num centers
         self.m = m # dim of centers
@@ -187,14 +188,19 @@ class SoftQuantize(torch.nn.Module):
         else:
             z = x.view(b, self.n_features, self.m, 1).repeat(1, 1, 1, self.L)
             c = self.c.view(1,1,self.m,self.L).repeat(b, self.n_features, 1, 1)
-            sigma = self.sigma.relu() + self.sigma_eps if self.sigma_trainable else self.sigma
+            if self.sigma_trainable:
+                sigma = self.sigma.relu() + self.sigma_eps 
+            elif self.quant_mode == 3:
+                sigma = self.hard_sigma
+            else:
+                sigma = self.sigma
             # print(f"--- sigma: {sigma} ---")
             q = self.softmax(-sigma*torch.sum(torch.pow(z - c, 2), 2))
             if self.quant_mode == 2:
                 return q # softmax outputs
-            elif self.quant_mode == 3: # hard quantization
-                q_max = torch.argmax(q, dim=2).view(b,self.n_features,1)
-                q = self.q_hot_template.scatter_(2, q_max, 1)
+            # elif self.quant_mode == 3: # hard quantization
+            #     q_max = torch.argmax(q, dim=2).view(b,self.n_features,1)
+            #     q = self.q_hot_template.scatter_(2, q_max, 1)
             c = self.c.view(1,self.m,self.L).repeat(b,1,1).transpose(2,1)
             out = torch.matmul(q, c)
             return out.view(b, self.r) # soft quantized outputs
@@ -457,7 +463,8 @@ if __name__ == "__main__":
                                             debug_flag=opt.debug_flag,
                                             str_mod=f"CsiNetQuant CR={cr} (best soft-quantization with sigma={checkpoint['best_sigma']})",
                                             n_train=data_train.shape[0],
-                                            pow_diff_t=pow_diff
+                                            pow_diff_t=pow_diff,
+                                            quant_bool=True
                                             )
 
         if not opt.debug_flag:                
@@ -501,7 +508,8 @@ if __name__ == "__main__":
                                             str_mod=f"CsiNetQuant CR={cr} (hard quantization)",
                                             n_train=data_train.shape[0],
                                             pow_diff_t=pow_diff,
-                                            key_mod="_hard"
+                                            key_mod="_hard",
+                                            quant_bool=True
                                             )
 
         # if not opt.debug_flag:                
