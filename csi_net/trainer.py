@@ -193,7 +193,7 @@ def fit(model, train_ldr, valid_ldr, batch_num, schedule=None, criterion=nn.MSEL
 
     return [model, checkpoint, history, optimizer, timers]
 
-def score(model, valid_ldr, data_val, batch_num, checkpoint, history, optimizer, timeslot=0, err_dict=None, timers=None, json_config=None, debug_flag=True, str_mod="", torch_type=torch.float, n_train=0, pow_diff_t=None, key_mod=""):
+def score(model, valid_ldr, data_val, batch_num, checkpoint, history, optimizer, timeslot=0, err_dict=None, timers=None, json_config=None, debug_flag=True, str_mod="", torch_type=torch.float, n_train=0, pow_diff_t=None, key_mod="", quant_bool=False):
     """
     take model, predict on valid_ldr, score
     currently scores a spherically normalized dataset
@@ -204,6 +204,8 @@ def score(model, valid_ldr, data_val, batch_num, checkpoint, history, optimizer,
     score_timer = timers["score_timer"]
 
     batch_size, minmax_file, norm_range = get_keys_from_json(json_config, keys=["batch_size", "minmax_file", "norm_range"])
+
+    test_entropy = 0
 
     with predict_timer:
         # y_hat = torch.zeros(data_val.shape).to(device)
@@ -231,6 +233,10 @@ def score(model, valid_ldr, data_val, batch_num, checkpoint, history, optimizer,
                 idx_e = min((i+1)*batch_size, y_hat.shape[0])
                 y_hat[idx_s:idx_e,:,:,:] = model(model_in).to("cpu")
                 y_test[idx_s:idx_e,:,:,:] = h_input.to("cpu")
+                if quant_bool:
+                    entropy = model.crossentropy_loss(model_in)
+                    test_entropy += entropy
+    test_entropy = test_entropy / i
 
     # for markovnet, we add "addend" to the error to get our actual estimates
     if type(err_dict) != type(None):            
@@ -275,6 +281,10 @@ def score(model, valid_ldr, data_val, batch_num, checkpoint, history, optimizer,
             print(f"-> {str_mod} - all | NMSE = {nmse:5.3f} | MSE = {mse:.4E}")
             checkpoint[f"best_nmse_full{key_mod}"] = nmse
             checkpoint[f"best_mse_full{key_mod}"] = mse
+
+        if quant_bool:
+            print(f"-> best_entropy={test_entropy:4.3E}")
+            checkpoint["best_entropy"] = test_entropy
 
     return [checkpoint, y_hat, y_test]
 
