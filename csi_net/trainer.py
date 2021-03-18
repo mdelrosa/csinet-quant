@@ -283,8 +283,10 @@ def score(model, valid_ldr, data_val, batch_num, checkpoint, history, optimizer,
             checkpoint[f"best_mse_full{key_mod}"] = mse
 
         if quant_bool:
-            print(f"-> best_entropy={test_entropy:4.3E}")
+            bpps = test_entropy * (model.latent_dim / model.quant.m) / (2*model.decoder.img_total) # bits per pixel
+            print(f"-> best_entropy={test_entropy:4.3E} - bpps={bpps:4.3f}")
             checkpoint["best_entropy"] = test_entropy
+            checkpoint["bpps"] = bpps
 
     return [checkpoint, y_hat, y_test]
 
