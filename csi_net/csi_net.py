@@ -261,6 +261,7 @@ if __name__ == "__main__":
     parser.add_argument("-dt", "--data_type", type=str, default="norm_H4", help="type of dataset to train on (norm_H4, norm_sphH4)")
     parser.add_argument("-L", "--num_centers", type=int, default=256, help="Number of cluster centers for vector quantization")
     parser.add_argument("-m", "--dim_centers", type=int, default=4, help="Dimensions for cluster centers for vector quantization")
+    parser.add_argument("-ec", "--epochs_centers", type=int, default=1000, help="Dimensions for cluster centers for vector quantization")
     opt = parser.parse_args()
 
     device = torch.device(f'cuda:{opt.gpu_num}' if torch.cuda.is_available() else 'cpu')
@@ -382,7 +383,7 @@ if __name__ == "__main__":
                 enc_train_ldr,
                 enc_valid_ldr,
                 batch_num,
-                epochs=epochs,
+                epochs=opt.epochs_centers,
                 timers=timers,
                 criterion=energy_loss,
                 json_config=json_config,
