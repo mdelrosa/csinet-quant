@@ -249,19 +249,20 @@ if __name__ == "__main__":
     parser.add_argument("-p1", "--pretrain1_bool", type=str2bool, default=False, help="bool for performing pretrain stage 1 (autoencoder with no latent quantization)")
     parser.add_argument("-p2", "--pretrain2_bool", type=str2bool, default=True, help="bool for performing pretrain stage 2 (training initial centers)")
     parser.add_argument("-tr", "--train_bool", type=str2bool, default=True, help="flag for toggling training for soft-to-hard vector quantization")
+    parser.add_argument("-lo", "--load_bool", type=str2bool, default=True, help="flag for toggling loading of soft-to-hard vector quantized model")
     parser.add_argument("-th", "--train_hard_bool", type=str2bool, default=True, help="flag for fine-tuning training on hard vector quantization)")
     parser.add_argument("-b", "--n_batch", type=int, default=20, help="number of batches to fit on (ignored during debug mode)")
     parser.add_argument("-l", "--dir", type=str, default=None, help="subdirectory for saving model, checkpoint, history")
-    parser.add_argument("-e", "--env", type=str, default="indoor", help="environment (either indoor or outdoor)")
+    parser.add_argument("-e", "--env", type=str, default="outdoor", help="environment (either indoor or outdoor)")
     parser.add_argument("-ep", "--epochs", type=int, default=10, help="number of epochs to train for")
     parser.add_argument("-sp", "--split", type=int, default=0, help="split of entire dataset. must be less than int(<total_num_files> / <n_batch>).")
     parser.add_argument("-t", "--n_truncate", type=int, default=32, help="value to truncate to along delay axis.")
     parser.add_argument("-ts", "--timeslot", type=int, default=0, help="timeslot which we are training (0-indexed).")
     parser.add_argument("-r", "--rate", type=int, default=512, help="number of elements in latent code (i.e., encoding rate)")
-    parser.add_argument("-dt", "--data_type", type=str, default="norm_H4", help="type of dataset to train on (norm_H4, norm_sphH4)")
+    parser.add_argument("-dt", "--data_type", type=str, default="norm_sphH4", help="type of dataset to train on (norm_H4, norm_sphH4)")
     parser.add_argument("-L", "--num_centers", type=int, default=256, help="Number of cluster centers for vector quantization")
     parser.add_argument("-m", "--dim_centers", type=int, default=4, help="Dimensions for cluster centers for vector quantization")
-    parser.add_argument("-ec", "--epochs_centers", type=int, default=1000, help="Dimensions for cluster centers for vector quantization")
+    parser.add_argument("-ec", "--epochs_centers", type=int, default=1000, help="Epochs for pretrain2 (cluster center initialization)")
     opt = parser.parse_args()
 
     device = torch.device(f'cuda:{opt.gpu_num}' if torch.cuda.is_available() else 'cpu')
@@ -294,7 +295,6 @@ if __name__ == "__main__":
     # handle renorm data
     print('-> pre-renorm: data_val range is from {} to {} -- data_val.shape = {}'.format(np.min(data_val),np.max(data_val),data_val.shape))
     data_all = np.concatenate((data_train, data_val), axis=0)
-    print(f"data_all.dtype: {data_all.dtype}")
     n_train, n_val = data_train.shape[0], data_val.shape[0]
     if norm_range == "norm_H4":
         data_all = renorm_H4(data_all, minmax_file)
@@ -302,7 +302,6 @@ if __name__ == "__main__":
         data_all = renorm_sphH4(data_all, minmax_file, t1_power_file, batch_num).astype(np.float32)
     data_train, data_val = data_all[:n_train], data_all[n_train:]
     print('-> post-renorm: data_val range is from {} to {} -- data_val.shape = {}'.format(np.min(data_val),np.max(data_val),data_val.shape))
-    print(f"data_all.dtype: {data_all.dtype}")
 
     if opt.dir != None:
         base_pickle += "/" + opt.dir
@@ -439,7 +438,7 @@ if __name__ == "__main__":
                                                                 anneal_bool=True)
             csinet_quant.quant.sigma = checkpoint["best_sigma"]
             csinet_quant.load_state_dict(checkpoint["best_model"])
-        else:
+        elif opt.load_bool:
             model_weights_name = f"{pickle_dir}/{network_name}-best-model.pt"
             print(f"---- Loading best model from {model_weights_name} ---")
             csinet_quant.load_state_dict(torch.load(model_weights_name))
@@ -449,6 +448,11 @@ if __name__ == "__main__":
                 checkpoint = pickle.load(f)
                 f.close()
             csinet_quant.quant.sigma = checkpoint["best_sigma"]
+        else:
+            print(f"---- Model performance without soft-to-hard vector quantization ---")
+            checkpoint = {"best_sigma": csinet_quant.quant.sigma, "latest_model": csinet_quant}
+            history = {}
+            optimizer = torch.optim.Adam(csinet_quant.parameters())
 
         del train_ldr, valid_ldr
         all_ldr = torch.utils.data.DataLoader(torch.from_numpy(data_all).to(device), batch_size=batch_size)
