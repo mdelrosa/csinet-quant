@@ -70,7 +70,7 @@ class Decoder(torch.nn.Module):
 
 class CsiNetQuant(nn.Module):
     """ CsiNet-Quant for csi estimation with entropy-based loss term """
-    def __init__(self, encoder, decoder, quant, latent_dim, batch_size=200, device=None, hard_sigma=1e6):
+    def __init__(self, encoder, decoder, quant, latent_dim, K_sigma=1, T_sigma=11719, batch_size=200, device=None, hard_sigma=1e6):
         super(CsiNetQuant, self).__init__()
         self.encoder = encoder
         self.decoder = decoder
@@ -86,8 +86,8 @@ class CsiNetQuant(nn.Module):
         # vals for annealing sigma
         self.hard_sigma = hard_sigma
 
-        self.T_sigma = 11719 # timescale of annealing (batches)
-        self.K_sigma = 1 # gain of annealing
+        self.T_sigma = T_sigma # timescale of annealing (batches)
+        self.K_sigma = K_sigma # gain of annealing
         self.t = 0 # index of current iteration for annealing
 
     def forward(self, H_in):
@@ -253,6 +253,7 @@ if __name__ == "__main__":
     parser.add_argument("-th", "--train_hard_bool", type=str2bool, default=True, help="flag for fine-tuning training on hard vector quantization)")
     parser.add_argument("-b", "--n_batch", type=int, default=20, help="number of batches to fit on (ignored during debug mode)")
     parser.add_argument("-l", "--dir", type=str, default=None, help="subdirectory for saving model, checkpoint, history")
+    parser.add_argument("-tl", "--tail_dir", type=str, default=None, help="subdirectory for saving model, checkpoint, history of SHVQ network")
     parser.add_argument("-e", "--env", type=str, default="outdoor", help="environment (either indoor or outdoor)")
     parser.add_argument("-ep", "--epochs", type=int, default=10, help="number of epochs to train for")
     parser.add_argument("-sp", "--split", type=int, default=0, help="split of entire dataset. must be less than int(<total_num_files> / <n_batch>).")
@@ -263,6 +264,7 @@ if __name__ == "__main__":
     parser.add_argument("-L", "--num_centers", type=int, default=256, help="Number of cluster centers for vector quantization")
     parser.add_argument("-m", "--dim_centers", type=int, default=4, help="Dimensions for cluster centers for vector quantization")
     parser.add_argument("-ec", "--epochs_centers", type=int, default=1000, help="Epochs for pretrain2 (cluster center initialization)")
+    parser.add_argument("-K", "--K_sigma", type=int, default=1, help="Epochs for pretrain2 (cluster center initialization)")
     opt = parser.parse_args()
 
     device = torch.device(f'cuda:{opt.gpu_num}' if torch.cuda.is_available() else 'cpu')
@@ -316,7 +318,7 @@ if __name__ == "__main__":
         encoder = Encoder(input_dim[0], input_dim[1], opt.n_truncate, cr)
         decoder = Decoder(input_dim[0], input_dim[1], opt.n_truncate, cr)
         quant = SoftQuantize(cr, opt.num_centers, opt.dim_centers, sigma_trainable=False, device=device)
-        csinet_quant = CsiNetQuant(encoder, decoder, quant, cr, device=device).to(device)
+        csinet_quant = CsiNetQuant(encoder, decoder, quant, cr, K_sigma=opt.K_sigma, device=device).to(device)
 
         pickle_dir = f"{base_pickle}/cr{cr}/t1"
 
@@ -404,7 +406,7 @@ if __name__ == "__main__":
 
         quant.init_centers(csinet_quant.quant.c.data)
         # quant.load_state_dict(OrderedDict({'c': }))
-        csinet_quant = CsiNetQuant(encoder, decoder, quant, cr, device=device).to(device) # remake network with non-trainable sigma
+        csinet_quant = CsiNetQuant(encoder, decoder, quant, cr, K_sigma=opt.K_sigma, device=device).to(device) # remake network with non-trainable sigma
 
         csinet_quant.quant.quant_mode = 1 # train with quantization layer
         print(f"-> sigma: {csinet_quant.quant.sigma}")
@@ -418,6 +420,10 @@ if __name__ == "__main__":
         #                 json_config=json_config,
         #                 quant_bool=True
         #                )
+
+        if opt.tail_dir != None:
+            pickle_dir += f"/{opt.tail_dir}" 
+            print(f"--- pickle_dir with tail_dir: {pickle_dir} ---")
 
         train_ldr = torch.utils.data.DataLoader(torch.from_numpy(data_train).to(device), batch_size=batch_size, shuffle=True) 
         valid_ldr = torch.utils.data.DataLoader(torch.from_numpy(data_val).to(device), batch_size=batch_size)
