@@ -21,9 +21,9 @@ def fit(model, train_ldr, valid_ldr, batch_num, schedule=None, criterion=nn.MSEL
 
     # criterion = nn.MSELoss()
     # TODO: if we use lr_schedule, then do we need to use SGD instead? 
-    lr = get_keys_from_json(json_config, keys=['learning_rate'])[0]
-    lr = lr / 10 if quant_bool else lr
-    beta, const_sigma = get_keys_from_json(json_config, keys=['beta', 'const_sigma'])
+    lr, lr_quant = get_keys_from_json(json_config, keys=['learning_rate', 'learning_rate_quant'])
+    lr = lr_quant if quant_bool else lr
+    beta, const_sigma, trainable_centers = get_keys_from_json(json_config, keys=['beta', 'const_sigma', 'trainable_centers'])
 
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=l2_weight)
     # TODO: Load in epoch
@@ -42,6 +42,8 @@ def fit(model, train_ldr, valid_ldr, batch_num, schedule=None, criterion=nn.MSEL
                     "test_loss": np.zeros(epochs)
                 }
     if quant_bool:
+        if not trainable_centers:
+            model.quant.c.requires_grad = False
         checkpoint["best_sigma"] = model.quant.sigma # init best_sigma
         history["train_mse"] = np.zeros(epochs)
         history["train_entropy"] = np.zeros(epochs)
@@ -187,9 +189,6 @@ def fit(model, train_ldr, valid_ldr, batch_num, schedule=None, criterion=nn.MSEL
                     val_str = f"Epoch #{epoch+1}/{epochs}: Training loss: {history['train_loss'][epoch]:4.3E} -- Test loss: {history['test_loss'][epoch]:4.3E}"
                 tqdm.write(val_str)
 
-            # sigma on exponential schedule -- multiply by 1.001
-            # if quant_bool:
-            #     model.quant.load_state_dict(OrderedDict({"sigma": torch.Tensor([const_sigma*sigma])}), strict=False)
 
     return [model, checkpoint, history, optimizer, timers]
 
@@ -246,7 +245,6 @@ def score(model, valid_ldr, data_val, batch_num, checkpoint, history, optimizer,
 
     # score model - account for spherical normalization
     with score_timer:
-        print(f"y_hat.shape: {y_hat.shape}")
         if y_hat.shape[1] == 1:
             y_hat = torch.cat((y_hat.real, y_hat.imag), 1)
             y_test = torch.cat((y_test.real, y_test.imag), 1)
