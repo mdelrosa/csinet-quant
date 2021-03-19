@@ -226,7 +226,7 @@ if __name__ == "__main__":
     import pickle
     import copy
     import sys
-    sys.path.append("/home/mason/git/brat")
+    sys.path.append("/home/mdelrosa/git/brat")
     from utils.NMSE_performance import renorm_H4, renorm_sphH4
     from utils.data_tools import dataset_pipeline_col, subsample_batches
     from utils.parsing import str2bool
