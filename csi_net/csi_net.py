@@ -226,7 +226,7 @@ if __name__ == "__main__":
     import pickle
     import copy
     import sys
-    sys.path.append("/home/mdelrosa/git/brat")
+    sys.path.append("/home/mason/git/brat")
     from utils.NMSE_performance import renorm_H4, renorm_sphH4
     from utils.data_tools import dataset_pipeline_col, subsample_batches
     from utils.parsing import str2bool
@@ -251,7 +251,8 @@ if __name__ == "__main__":
     parser.add_argument("-tr", "--train_bool", type=str2bool, default=True, help="flag for toggling training for soft-to-hard vector quantization")
     parser.add_argument("-lo", "--load_bool", type=str2bool, default=True, help="flag for toggling loading of soft-to-hard vector quantized model")
     parser.add_argument("-th", "--train_hard_bool", type=str2bool, default=True, help="flag for fine-tuning training on hard vector quantization)")
-    parser.add_argument("-b", "--n_batch", type=int, default=20, help="number of batches to fit on (ignored during debug mode)")
+    parser.add_argument("-nb", "--n_batch", type=int, default=20, help="number of batches to fit on (ignored during debug mode)")
+    parser.add_argument("-b", "--beta", type=float, default=1e-5, help="hyperparam for entropy loss")
     parser.add_argument("-l", "--dir", type=str, default=None, help="subdirectory for saving model, checkpoint, history")
     parser.add_argument("-tl", "--tail_dir", type=str, default=None, help="subdirectory for saving model, checkpoint, history of SHVQ network")
     parser.add_argument("-e", "--env", type=str, default="outdoor", help="environment (either indoor or outdoor)")
@@ -441,7 +442,10 @@ if __name__ == "__main__":
                                                                 pickle_dir=pickle_dir,
                                                                 network_name=network_name,
                                                                 quant_bool=True,
-                                                                anneal_bool=True)
+                                                                anneal_bool=True,
+                                                                beta=opt.beta,
+                                                                data_all=data_all 
+                                                                )
             csinet_quant.quant.sigma = checkpoint["best_sigma"]
             csinet_quant.load_state_dict(checkpoint["best_model"])
         elif opt.load_bool:
@@ -472,7 +476,7 @@ if __name__ == "__main__":
                                             timers=timers,
                                             json_config=json_config,
                                             debug_flag=opt.debug_flag,
-                                            str_mod=f"CsiNetQuant CR={cr} (best soft-quantization with sigma={checkpoint['best_sigma']})",
+                                            str_mod=f"CsiNetQuant CR={cr} (best soft-quantization with sigma={checkpoint['best_sigma']:4.3f})",
                                             n_train=data_train.shape[0],
                                             pow_diff_t=pow_diff,
                                             quant_bool=True

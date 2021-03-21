@@ -7,23 +7,24 @@ from tqdm import tqdm
 from torch import nn, optim, autograd
 from collections import OrderedDict
 
-sys.path.append("/home/mdelrosa/git/brat")
+sys.path.append("/home/mason/git/brat")
 from utils.NMSE_performance import get_NMSE, denorm_H3, denorm_H4, denorm_sphH4
 from utils.data_tools import dataset_pipeline, subsample_batches, split_complex, load_pow_diff
 from utils.unpack_json import get_keys_from_json
 
-def fit(model, train_ldr, valid_ldr, batch_num, schedule=None, criterion=nn.MSELoss(), epochs=10, timers=None, json_config=None, debug_flag=True, pickle_dir=".", input_type="split", patience=1000, network_name=None, quant_bool=False, anneal_bool=False, l2_weight=1e-12):
+def fit(model, train_ldr, valid_ldr, batch_num, beta=1e-5, schedule=None, criterion=nn.MSELoss(), epochs=10, timers=None, json_config=None, torch_type=torch.float, debug_flag=True, pickle_dir=".", input_type="split", patience=1000, network_name=None, quant_bool=False, anneal_bool=False, l2_weight=1e-12, data_all=None, timeslot=0,):
     # pull out timers
     fit_timer = timers["fit_timer"] 
 
     # load hyperparms
     network_name = get_keys_from_json(json_config, keys=["network_name"])[0] if network_name == None else network_name
+    batch_size, minmax_file, norm_range = get_keys_from_json(json_config, keys=["batch_size", "minmax_file", "norm_range"])
 
     # criterion = nn.MSELoss()
     # TODO: if we use lr_schedule, then do we need to use SGD instead? 
     lr, lr_quant = get_keys_from_json(json_config, keys=['learning_rate', 'learning_rate_quant'])
     lr = lr_quant if quant_bool else lr
-    beta, const_sigma, trainable_centers = get_keys_from_json(json_config, keys=['beta', 'const_sigma', 'trainable_centers'])
+    const_sigma, trainable_centers = get_keys_from_json(json_config, keys=['const_sigma', 'trainable_centers'])
 
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=l2_weight)
     # TODO: Load in epoch
@@ -53,6 +54,9 @@ def fit(model, train_ldr, valid_ldr, batch_num, schedule=None, criterion=nn.MSEL
             history["train_gap"] = np.zeros(epochs)
             history["test_gap"] = np.zeros(epochs)
 
+    if type(data_all) != None:
+        history["nmse_denorm"] = np.zeros(epochs)
+        history["mse_denorm"] = np.zeros(epochs)
 
     best_test_loss = None
     epochs_no_improvement = 0
@@ -119,9 +123,15 @@ def fit(model, train_ldr, valid_ldr, batch_num, schedule=None, criterion=nn.MSEL
                 if anneal_bool:
                     history["train_gap"][epoch] = train_gap.detach().to("cpu").numpy() / (i+1)
 
+            if epoch == 0:
+                n_train = batch_size*(i+1)
+
             # validation step
             # model.training = False # optionally check just the MSE performance during eval
             with torch.no_grad():
+                if type(data_all) != type(None):
+                    y_hat = torch.zeros(data_all.shape, dtype=torch_type).to("cpu")
+                    y_test = torch.zeros(data_all.shape, dtype=torch_type).to("cpu")
                 test_loss = 0
                 test_mse = 0
                 test_entropy = 0
@@ -141,6 +151,12 @@ def fit(model, train_ldr, valid_ldr, batch_num, schedule=None, criterion=nn.MSEL
                     dec = model(model_in)
                     mse = criterion(dec, h_input)
                     # test_loss += mse
+
+                    if type(data_all) != type(None):
+                        idx_s = i*batch_size
+                        idx_e = min((i+1)*batch_size, y_hat.shape[0])
+                        y_hat[n_train+idx_s:n_train+idx_e,:,:,:] = model(model_in).to("cpu")
+                        y_test[n_train+idx_s:n_train+idx_e,:,:,:] = h_input.to("cpu")
                     if quant_bool:
                         entropy = model.crossentropy_loss(model_in)
                         test_entropy += entropy
@@ -152,6 +168,25 @@ def fit(model, train_ldr, valid_ldr, batch_num, schedule=None, criterion=nn.MSEL
                         loss_i = mse
                     test_loss += loss_i
                 history["test_loss"][epoch] = test_loss.detach().to("cpu").numpy() / (i+1)
+
+                if type(data_all) != type(None):
+                    # calculate nmse
+                    if norm_range == "norm_H4":
+                        y_hat_denorm = denorm_H4(y_hat.to("cpu").detach().numpy(),minmax_file)
+                        y_test_denorm = denorm_H4(y_test.to("cpu").detach().numpy(),minmax_file)
+                    elif norm_range == "norm_sphH4":
+                        t1_power_file = get_keys_from_json(json_config, keys=["t1_power_file"])[0]
+                        y_hat_denorm = denorm_sphH4(y_hat.detach().numpy(),minmax_file, t1_power_file, batch_num, timeslot=timeslot)
+                        y_test_denorm = denorm_sphH4(y_test.detach().numpy(),minmax_file, t1_power_file, batch_num, timeslot=timeslot)
+                    y_test_denorm, y_hat_denorm = y_test_denorm[n_train:,:,:,:], y_hat_denorm[n_train:,:,:,:]
+                    y_hat_denorm = y_hat_denorm[:,0,:,:] + 1j*y_hat_denorm[:,1,:,:]
+                    y_test_denorm = y_test_denorm[:,0,:,:] + 1j*y_test_denorm[:,1,:,:]
+                    y_shape = y_test_denorm.shape
+                    mse_denorm, nmse_denorm = get_NMSE(y_hat_denorm, y_test_denorm, return_mse=True, n_ang=y_shape[1], n_del=y_shape[2]) # one-step prediction -> estimate of single timeslot
+                    # print(f"-> {str_mod} - truncate | NMSE = {nmse:5.3f} | MSE = {mse:.4E}")
+                    history["nmse_denorm"] = nmse_denorm
+                    history["mse_denorm"] = mse_denorm
+
                 if quant_bool:
                     history["test_mse"][epoch] = test_mse.detach().to("cpu").numpy() / (i+1)
                     history["test_entropy"][epoch] = test_entropy.detach().to("cpu").numpy() / (i+1)
@@ -181,15 +216,21 @@ def fit(model, train_ldr, valid_ldr, batch_num, schedule=None, criterion=nn.MSEL
                 #     print(f"Epoch #{epoch+1}/{epochs}: Test loss: {history['test_loss'][epoch]:.5E}. Grace period is {grace_period} epochs.")
                 checkpoint["latest_model"] = copy.deepcopy(model).to("cpu").state_dict()
                 if quant_bool:
-                    if anneal_bool:
-                        val_str = f"Epoch #{epoch+1}/{epochs}: Training (loss: {history['train_loss'][epoch]:4.3E} | mse: {history['train_mse'][epoch]:4.3E} | entropy: {history['train_entropy'][epoch]:4.3E} | gap: {history['train_gap'][epoch]:4.3E}) Test (loss: {history['test_loss'][epoch]:4.3E} | mse: {history['test_mse'][epoch]:4.3E} | entropy: {history['test_entropy'][epoch]:4.3E} | gap: {history['test_gap'][epoch]:4.3E})"
+                    if type(data_all) != type(None):
+                        if anneal_bool:
+                            val_str = f"Epoch #{epoch+1}/{epochs}: Training (loss: {history['train_loss'][epoch]:4.3E} | mse: {history['train_mse'][epoch]:4.3E} | entropy: {history['train_entropy'][epoch]:4.3E} | gap: {history['train_gap'][epoch]:4.3E}) Test (loss: {history['test_loss'][epoch]:4.3E} | mse: {history['test_mse'][epoch]:4.3E} | entropy: {history['test_entropy'][epoch]:4.3E} | gap: {history['test_gap'][epoch]:4.3E} | nmse_denorm: {nmse_denorm})"
+                        else:
+                            val_str = f"Epoch #{epoch+1}/{epochs}: Training (loss: {history['train_loss'][epoch]:4.3E} | mse: {history['train_mse'][epoch]:4.3E} | entropy: {history['train_entropy'][epoch]:4.3E}) Test (loss: {history['test_loss'][epoch]:4.3E} | mse: {history['test_mse'][epoch]:4.3E} | entropy: {history['test_entropy'][epoch]:4.3E} | nmse_denorm: {nmse_denorm})"
                     else:
-                        val_str = f"Epoch #{epoch+1}/{epochs}: Training (loss: {history['train_loss'][epoch]:4.3E} | mse: {history['train_mse'][epoch]:4.3E} | entropy: {history['train_entropy'][epoch]:4.3E}) Test (loss: {history['test_loss'][epoch]:4.3E} | mse: {history['test_mse'][epoch]:4.3E} | entropy: {history['test_entropy'][epoch]:4.3E})"
+                        if anneal_bool:
+                            val_str = f"Epoch #{epoch+1}/{epochs}: Training (loss: {history['train_loss'][epoch]:4.3E} | mse: {history['train_mse'][epoch]:4.3E} | entropy: {history['train_entropy'][epoch]:4.3E} | gap: {history['train_gap'][epoch]:4.3E}) Test (loss: {history['test_loss'][epoch]:4.3E} | mse: {history['test_mse'][epoch]:4.3E} | entropy: {history['test_entropy'][epoch]:4.3E} | gap: {history['test_gap'][epoch]:4.3E})"
+                        else:
+                            val_str = f"Epoch #{epoch+1}/{epochs}: Training (loss: {history['train_loss'][epoch]:4.3E} | mse: {history['train_mse'][epoch]:4.3E} | entropy: {history['train_entropy'][epoch]:4.3E}) Test (loss: {history['test_loss'][epoch]:4.3E} | mse: {history['test_mse'][epoch]:4.3E} | entropy: {history['test_entropy'][epoch]:4.3E})"
                 else:
                     val_str = f"Epoch #{epoch+1}/{epochs}: Training loss: {history['train_loss'][epoch]:4.3E} -- Test loss: {history['test_loss'][epoch]:4.3E}"
                 tqdm.write(val_str)
 
-
+    print(f"--- checkpoint['best_sigma'] = {checkpoint['best_sigma']:4.3f} ---")
     return [model, checkpoint, history, optimizer, timers]
 
 def score(model, valid_ldr, data_val, batch_num, checkpoint, history, optimizer, timeslot=0, err_dict=None, timers=None, json_config=None, debug_flag=True, str_mod="", torch_type=torch.float, n_train=0, pow_diff_t=None, key_mod="", quant_bool=False):
