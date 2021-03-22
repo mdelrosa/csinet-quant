@@ -230,7 +230,7 @@ def fit(model, train_ldr, valid_ldr, batch_num, beta=1e-5, schedule=None, criter
                     val_str = f"Epoch #{epoch+1}/{epochs}: Training loss: {history['train_loss'][epoch]:4.3E} -- Test loss: {history['test_loss'][epoch]:4.3E}"
                 tqdm.write(val_str)
 
-    print(f"--- checkpoint['best_sigma'] = {checkpoint['best_sigma']:4.3f} ---")
+    # print(f"--- checkpoint['best_sigma'] = {checkpoint['best_sigma']:4.3f} ---")
     return [model, checkpoint, history, optimizer, timers]
 
 def score(model, valid_ldr, data_val, batch_num, checkpoint, history, optimizer, timeslot=0, err_dict=None, timers=None, json_config=None, debug_flag=True, str_mod="", torch_type=torch.float, n_train=0, pow_diff_t=None, key_mod="", quant_bool=False):
