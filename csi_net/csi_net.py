@@ -257,6 +257,7 @@ if __name__ == "__main__":
     parser.add_argument("-tl", "--tail_dir", type=str, default=None, help="subdirectory for saving model, checkpoint, history of SHVQ network")
     parser.add_argument("-e", "--env", type=str, default="outdoor", help="environment (either indoor or outdoor)")
     parser.add_argument("-ep", "--epochs", type=int, default=10, help="number of epochs to train for")
+    parser.add_argument("-ef", "--epochs_finetune", type=int, default=50, help="number of epochs to use for shvq finetuning")
     parser.add_argument("-sp", "--split", type=int, default=0, help="split of entire dataset. must be less than int(<total_num_files> / <n_batch>).")
     parser.add_argument("-t", "--n_truncate", type=int, default=32, help="value to truncate to along delay axis.")
     parser.add_argument("-ts", "--timeslot", type=int, default=0, help="timeslot which we are training (0-indexed).")
@@ -281,7 +282,7 @@ if __name__ == "__main__":
     # aux_bool_list = get_keys_from_json(json_config, keys=["aux_bool"], is_bool=True)
 
     input_dim = (2,32,n_delay)
-    epochs = 1 if opt.debug_flag else opt.epochs
+
 
     batch_num = 1 if opt.debug_flag else opt.n_batch # dataset batches
     M_1 = None # legacy holdover from CsiNet-LSTM
@@ -324,6 +325,7 @@ if __name__ == "__main__":
         pickle_dir = f"{base_pickle}/cr{cr}/t1"
 
         csinet_quant.quant.quant_mode = 0 # pretrain with no latent quantization
+        epochs = 1 if opt.debug_flag else opt.epochs # epochs for intial, non-quantized network performance
         if opt.pretrain1_bool:
             model, checkpoint, history, optimizer, timers = fit(csinet_quant,
                                                                 train_ldr,
@@ -381,6 +383,7 @@ if __name__ == "__main__":
             print(f"--- sampled_centers.shape: {sampled_centers.shape} ---")
             csinet_quant.quant.init_centers(sampled_centers)
 
+            epochs = 1 if opt.debug_flag else opt.epochs_centers # epochs for intial, non-quantized network performance
             fit(csinet_quant.quant,
                 enc_train_ldr,
                 enc_valid_ldr,
@@ -430,6 +433,7 @@ if __name__ == "__main__":
         valid_ldr = torch.utils.data.DataLoader(torch.from_numpy(data_val).to(device), batch_size=batch_size)
         # all_ldr = torch.utils.data.DataLoader(torch.from_numpy(data_all).to(device), batch_size=batch_size)
 
+        epochs = 1 if opt.debug_flag else opt.epochs_finetune # epochs for intial, non-quantized network performance
         if opt.train_bool:
             model, checkpoint, history, optimizer, timers = fit(csinet_quant,
                                                                 train_ldr,
