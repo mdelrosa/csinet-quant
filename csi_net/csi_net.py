@@ -8,7 +8,7 @@ from torchvision import transforms
 from collections import OrderedDict
 
 import numpy as np
-import matplotlib.pyplot as plt
+# import matplotlib.pyplot as plt
 from tqdm import trange, tqdm
 
 class Encoder(torch.nn.Module):
@@ -226,7 +226,7 @@ if __name__ == "__main__":
     import pickle
     import copy
     import sys
-    sys.path.append("/home/mason/git/brat")
+    sys.path.append("/home/mdelrosa/git/brat")
     from utils.NMSE_performance import renorm_H4, renorm_sphH4
     from utils.data_tools import dataset_pipeline_col, subsample_batches
     from utils.parsing import str2bool
@@ -364,6 +364,8 @@ if __name__ == "__main__":
                                             n_train=data_train.shape[0],
                                             pow_diff_t=pow_diff
                                             )
+
+
         if not opt.debug_flag:                
             save_checkpoint_history(checkpoint, history, optimizer, dir=pickle_dir, network_name=f"{network_name}-pretrain")
         
@@ -412,6 +414,28 @@ if __name__ == "__main__":
         csinet_quant.quant.quant_mode = 1 # train with quantization layer
         print(f"-> sigma: {csinet_quant.quant.sigma}")
         print(f"-> centers: {csinet_quant.quant.c}")
+
+        checkpoint = {}
+        all_ldr = torch.utils.data.DataLoader(torch.from_numpy(data_all).to(device), batch_size=batch_size)
+        [checkpoint, y_hat, y_test] = score(csinet_quant,
+                                            all_ldr,
+                                            data_all,
+                                            batch_num,
+                                            checkpoint,
+                                            history,
+                                            optimizer,
+                                            timers=timers,
+                                            json_config=json_config,
+                                            debug_flag=opt.debug_flag,
+                                            str_mod=f"CsiNetQuant CR={cr} (after training centers, sigma={csinet_quant.quant.sigma:4.3f})",
+                                            n_train=data_train.shape[0],
+                                            pow_diff_t=pow_diff,
+                                            quant_bool=True
+                                            )
+
+        init_nmse = checkpoint["best_nmse"] # save nmse from checkpoint
+        print(f"--- after center pretraining, init_nmse={init_nmse} ---")
+        del all_ldr
 
         # profile_network(csinet_quant,
         #                 train_ldr,
@@ -481,6 +505,7 @@ if __name__ == "__main__":
                                             pow_diff_t=pow_diff,
                                             quant_bool=True
                                             )
+        history["init_nmse"] = init_nmse
 
         if not opt.debug_flag:                
             save_checkpoint_history(checkpoint, history, optimizer, dir=pickle_dir, network_name=network_name)
