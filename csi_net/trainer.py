@@ -5,10 +5,11 @@ import pickle
 import numpy as np
 from tqdm import tqdm
 from torch import nn, optim, autograd
+from torch.utils.checkpoint import checkpoint_sequential
 from collections import OrderedDict
 
 sys.path.append("/home/mason/git/brat")
-from utils.NMSE_performance import get_NMSE, denorm_H3, denorm_H4, denorm_sphH4
+from utils.NMSE_performance import get_NMSE, denorm_H3, denorm_H4, denorm_sphH4, denorm_muH4, denorm_sphmuH4
 from utils.data_tools import dataset_pipeline, subsample_batches, split_complex, load_pow_diff
 from utils.unpack_json import get_keys_from_json
 
@@ -18,7 +19,7 @@ def fit(model, train_ldr, valid_ldr, batch_num, beta=1e-5, schedule=None, criter
 
     # load hyperparms
     network_name = get_keys_from_json(json_config, keys=["network_name"])[0] if network_name == None else network_name
-    batch_size, minmax_file, norm_range = get_keys_from_json(json_config, keys=["batch_size", "minmax_file", "norm_range"])
+    batch_size, minmax_file, norm_range, thresh_idx_path = get_keys_from_json(json_config, keys=["batch_size", "minmax_file", "norm_range", "thresh_idx_path"])
 
     # criterion = nn.MSELoss()
     # TODO: if we use lr_schedule, then do we need to use SGD instead? 
@@ -67,6 +68,7 @@ def fit(model, train_ldr, valid_ldr, batch_num, beta=1e-5, schedule=None, criter
 
     autograd.set_detect_anomaly(True)
 
+    n_train = 0
     with fit_timer:
         for epoch in range(epochs):
             train_loss = 0
@@ -84,7 +86,9 @@ def fit(model, train_ldr, valid_ldr, batch_num, beta=1e-5, schedule=None, criter
                 h_input = autograd.Variable(data_batch)
                 optimizer.zero_grad()
                 model_in = h_input if len(data_tuple) != 2 else [aux_input, h_input]
+                # dec = checkpoint_sequential(model, 3, model_in)
                 dec = model(model_in)
+                batch_size_i = dec.size(0)
                 mse = criterion(dec, h_input)
                 if quant_bool:
                     entropy = model.crossentropy_loss(model_in)
@@ -112,6 +116,9 @@ def fit(model, train_ldr, valid_ldr, batch_num, beta=1e-5, schedule=None, criter
                 else:
                     tqdm_str = f"Epoch #{epoch+1}/{epochs}: Training loss: {mse.data:.5E}" 
                 tqdm.write(tqdm_str)
+                if epoch == 0:
+                    n_train += batch_size_i
+
             # post training step, dump to checkpoint
             checkpoint["model"] = copy.deepcopy(model).to("cpu").state_dict()
             optimizer_state = copy.deepcopy(optimizer.state_dict())
@@ -123,15 +130,13 @@ def fit(model, train_ldr, valid_ldr, batch_num, beta=1e-5, schedule=None, criter
                 if anneal_bool:
                     history["train_gap"][epoch] = train_gap.detach().to("cpu").numpy() / (i+1)
 
-            if epoch == 0:
-                n_train = batch_size*(i+1)
-
             # validation step
             # model.training = False # optionally check just the MSE performance during eval
             with torch.no_grad():
                 if type(data_all) != type(None):
                     y_hat = torch.zeros(data_all.shape, dtype=torch_type).to("cpu")
                     y_test = torch.zeros(data_all.shape, dtype=torch_type).to("cpu")
+                    print(f"-> y_hat.shape: {y_hat.shape} ")
                 test_loss = 0
                 test_mse = 0
                 test_entropy = 0
@@ -148,6 +153,7 @@ def fit(model, train_ldr, valid_ldr, batch_num, beta=1e-5, schedule=None, criter
                     h_input = autograd.Variable(data_batch)
                     optimizer.zero_grad()
                     model_in = h_input if len(data_tuple) != 2 else [aux_input, h_input]
+                    # dec = checkpoint_sequential(model, 3, model_in)
                     dec = model(model_in)
                     mse = criterion(dec, h_input)
                     # test_loss += mse
@@ -176,8 +182,16 @@ def fit(model, train_ldr, valid_ldr, batch_num, beta=1e-5, schedule=None, criter
                         y_test_denorm = denorm_H4(y_test.to("cpu").detach().numpy(),minmax_file)
                     elif norm_range == "norm_sphH4":
                         t1_power_file = get_keys_from_json(json_config, keys=["t1_power_file"])[0]
-                        y_hat_denorm = denorm_sphH4(y_hat.detach().numpy(),minmax_file, t1_power_file, batch_num, timeslot=timeslot)
-                        y_test_denorm = denorm_sphH4(y_test.detach().numpy(),minmax_file, t1_power_file, batch_num, timeslot=timeslot)
+                        y_hat_denorm = denorm_sphH4(y_hat.detach().numpy(),minmax_file, t1_power_file, batch_num, timeslot=timeslot, thresh_idx_path=thresh_idx_path)
+                        y_test_denorm = denorm_sphH4(y_test.detach().numpy(),minmax_file, t1_power_file, batch_num, timeslot=timeslot, thresh_idx_path=thresh_idx_path)
+                    elif norm_range == "norm_muH4":
+                        mu = get_keys_from_json(json_config, keys=["mu"])[0]
+                        y_hat_denorm = denorm_muH4(y_hat.detach().numpy(), minmax_file, mu=mu)
+                        y_test_denorm = denorm_muH4(y_test.detach().numpy(), minmax_file, mu=mu)
+                    elif norm_range == "norm_sphmuH4":
+                        mu, t1_power_file = get_keys_from_json(json_config, keys=["mu", "t1_power_file"])
+                        y_hat_denorm = denorm_sphmuH4(y_hat.detach().numpy(), minmax_file, t1_power_file, mu=mu, timeslot=timeslot, thresh_idx_path=thresh_idx_path)
+                        y_test_denorm = denorm_sphmuH4(y_test.detach().numpy(), minmax_file, t1_power_file, mu=mu, timeslot=timeslot, thresh_idx_path=thresh_idx_path)
                     y_test_denorm, y_hat_denorm = y_test_denorm[n_train:,:,:,:], y_hat_denorm[n_train:,:,:,:]
                     y_hat_denorm = y_hat_denorm[:,0,:,:] + 1j*y_hat_denorm[:,1,:,:]
                     y_test_denorm = y_test_denorm[:,0,:,:] + 1j*y_test_denorm[:,1,:,:]
@@ -233,7 +247,7 @@ def fit(model, train_ldr, valid_ldr, batch_num, beta=1e-5, schedule=None, criter
     # print(f"--- checkpoint['best_sigma'] = {checkpoint['best_sigma']:4.3f} ---")
     return [model, checkpoint, history, optimizer, timers]
 
-def score(model, valid_ldr, data_val, batch_num, checkpoint, history, optimizer, timeslot=0, err_dict=None, timers=None, json_config=None, debug_flag=True, str_mod="", torch_type=torch.float, n_train=0, pow_diff_t=None, key_mod="", quant_bool=False):
+def score(model, valid_ldr, data_val, batch_num, checkpoint, history, optimizer, timeslot=0, err_dict=None, timers=None, json_config=None, debug_flag=True, str_mod="", torch_type=torch.float, n_train=0, pow_diff_t=None, key_mod="", quant_bool=False, entropy_coding=False, count_centers=False):
     """
     take model, predict on valid_ldr, score
     currently scores a spherically normalized dataset
@@ -243,7 +257,7 @@ def score(model, valid_ldr, data_val, batch_num, checkpoint, history, optimizer,
     predict_timer = timers["predict_timer"]
     score_timer = timers["score_timer"]
 
-    batch_size, minmax_file, norm_range = get_keys_from_json(json_config, keys=["batch_size", "minmax_file", "norm_range"])
+    batch_size, minmax_file, norm_range, thresh_idx_path = get_keys_from_json(json_config, keys=["batch_size", "minmax_file", "norm_range", "thresh_idx_path"])
 
     test_entropy = 0
 
@@ -299,8 +313,16 @@ def score(model, valid_ldr, data_val, batch_num, checkpoint, history, optimizer,
             y_test_denorm = denorm_H4(y_test.to("cpu").detach().numpy(),minmax_file)
         elif norm_range == "norm_sphH4":
             t1_power_file = get_keys_from_json(json_config, keys=["t1_power_file"])[0]
-            y_hat_denorm = denorm_sphH4(y_hat.detach().numpy(),minmax_file, t1_power_file, batch_num, timeslot=timeslot)
-            y_test_denorm = denorm_sphH4(y_test.detach().numpy(),minmax_file, t1_power_file, batch_num, timeslot=timeslot)
+            y_hat_denorm = denorm_sphH4(y_hat.detach().numpy(),minmax_file, t1_power_file, batch_num, timeslot=timeslot, thresh_idx_path=thresh_idx_path)
+            y_test_denorm = denorm_sphH4(y_test.detach().numpy(),minmax_file, t1_power_file, batch_num, timeslot=timeslot, thresh_idx_path=thresh_idx_path)
+        elif norm_range == "norm_muH4":
+            mu = get_keys_from_json(json_config, keys=["mu"])[0]
+            y_hat_denorm = denorm_muH4(y_hat.detach().numpy(), minmax_file, mu=mu)
+            y_test_denorm = denorm_muH4(y_test.detach().numpy(), minmax_file, mu=mu)
+        elif norm_range == "norm_sphmuH4":
+            mu, t1_power_file = get_keys_from_json(json_config, keys=["mu", "t1_power_file"])
+            y_hat_denorm = denorm_sphmuH4(y_hat.detach().numpy(), minmax_file, t1_power_file, mu=mu, timeslot=timeslot, thresh_idx_path=thresh_idx_path)
+            y_test_denorm = denorm_sphmuH4(y_test.detach().numpy(), minmax_file, t1_power_file, mu=mu, timeslot=timeslot, thresh_idx_path=thresh_idx_path)
         # predicted on pooled data -- split out validation set
         print('-> post denorm: y_hat range is from {} to {}'.format(np.min(y_hat_denorm),np.max(y_hat_denorm)))
         print('-> post denorm: y_test range is from {} to {}'.format(np.min(y_test_denorm),np.max(y_test_denorm)))
@@ -328,6 +350,81 @@ def score(model, valid_ldr, data_val, batch_num, checkpoint, history, optimizer,
             checkpoint["bpps"] = bpps
 
     return [checkpoint, y_hat, y_test]
+
+def count_centers(model, valid_ldr, batch_num, timeslot=0, err_dict=None, timers=None, json_config=None, debug_flag=True, str_mod="", torch_type=torch.float, n_train=0, pow_diff_t=None, key_mod="", quant_bool=False, entropy_coding=False, count_centers=False):
+    """
+    take model, predict on valid_ldr, score
+    count occurrences for each center
+    """
+    # pull out timers
+    predict_timer = timers["predict_timer"]
+    score_timer = timers["score_timer"]
+
+    batch_size, minmax_file, norm_range, thresh_idx_path = get_keys_from_json(json_config, keys=["batch_size", "minmax_file", "norm_range", "thresh_idx_path"])
+
+    test_entropy = 0
+
+    model.quant.mode = 2
+
+    with predict_timer:
+        # y_hat = torch.zeros(data_val.shape).to(device)
+        # y_test = torch.zeros(data_val.shape).to(device)
+        model.training = False
+        model.eval()
+        with torch.no_grad():
+            # y_hat = torch.zeros(data_val.shape, dtype=torch_type).to("cpu")
+            # y_test = torch.zeros(data_val.shape, dtype=torch_type).to("cpu")
+            for i, data_tuple in enumerate(valid_ldr):
+                # inputs = autograd.Variable(data_batch).float()
+                if len(data_tuple) != 2:
+                    data_batch = data_tuple
+                # elif len(data_tuple) == 2:
+                else:
+                    aux_batch, data_batch = data_tuple
+                    aux_input = autograd.Variable(aux_batch)
+                h_input = autograd.Variable(data_batch)
+                model_in = h_input if len(data_tuple) != 2 else [aux_input, h_input]
+                y_hat = model(model_in)
+
+    print(f"model.H_counts: {model.H_counts}")
+
+def arithmetic_encoding(model, valid_ldr, batch_num, timeslot=0, err_dict=None, timers=None, json_config=None, debug_flag=True, str_mod="", torch_type=torch.float, n_train=0, pow_diff_t=None, key_mod="", quant_bool=False, entropy_coding=False, count_centers=False):
+    """
+    take model, predict on valid_ldr, score
+    inference with arithmetic encoding in latent layer
+    """
+    # pull out timers
+    predict_timer = timers["predict_timer"]
+    score_timer = timers["score_timer"]
+
+    batch_size, minmax_file, norm_range, thresh_idx_path = get_keys_from_json(json_config, keys=["batch_size", "minmax_file", "norm_range", "thresh_idx_path"])
+
+    test_entropy = 0
+
+    model.quant.mode = 2
+
+    with predict_timer:
+        # y_hat = torch.zeros(data_val.shape).to(device)
+        # y_test = torch.zeros(data_val.shape).to(device)
+        model.training = False
+        model.eval()
+        with torch.no_grad():
+            # y_hat = torch.zeros(data_val.shape, dtype=torch_type).to("cpu")
+            # y_test = torch.zeros(data_val.shape, dtype=torch_type).to("cpu")
+            for i, data_tuple in enumerate(valid_ldr):
+                print(f"=> batch #{i}")
+                # inputs = autograd.Variable(data_batch).float()
+                if len(data_tuple) != 2:
+                    data_batch = data_tuple
+                # elif len(data_tuple) == 2:
+                else:
+                    aux_batch, data_batch = data_tuple
+                    aux_input = autograd.Variable(aux_batch)
+                h_input = autograd.Variable(data_batch)
+                model_in = h_input if len(data_tuple) != 2 else [aux_input, h_input]
+                y_hat = model(model_in)
+
+    # print(f"model.message_bit_lens: mean={np.mean(csinet_quant.message_bit_lens)} - min={np.min(csinet_quant.message_bit_lens)} - max={np.max(csinet_quant.message_bit_lens)} ")
 
 def profile_network(model, train_ldr, valid_ldr, batch_num, schedule=None, criterion=nn.MSELoss(), epochs=10, timers=None, json_config=None, quant_bool=True):
     lr = get_keys_from_json(json_config, keys=['learning_rate'])[0] 

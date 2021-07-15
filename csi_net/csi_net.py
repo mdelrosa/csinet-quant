@@ -110,7 +110,7 @@ class CsiNetQuant(nn.Module):
         #     self.p_hist[val] = torch.true_divide(num_val, self.quant.n_features*b)
 
         # parallel impl
-        self.p_hist = torch.true_divide(torch.sum(torch.sum(self.p_mask == H_idx.unsqueeze(1).repeat(1,self.quant.L,1), axis=0), axis=1), self.quant.n_features*b)
+        self.p_hist = torch.true_divide(torch.sum(torch.sum(self.p_mask[:b, :] == H_idx.unsqueeze(1).repeat(1,self.quant.L,1), axis=0), axis=1), self.quant.n_features*b)
         p_hard = self.p_hist.view(1,1,self.quant.L).repeat(b,self.quant.n_features,1)
         p_hard = torch.clamp(p_hard, clip_val, 1.0)
         # store back original quant_mode, sigma values
@@ -163,7 +163,8 @@ class SoftQuantize(torch.nn.Module):
         """
         super(SoftQuantize, self).__init__()
         self.sigma_trainable = sigma_trainable
-        self.sigma = torch.nn.Parameter(data=torch.Tensor([sigma]), requires_grad=True) if sigma_trainable else sigma
+        # self.sigma = torch.nn.Parameter(data=torch.Tensor([sigma]).to(device), requires_grad=True) if sigma_trainable else sigma.to(device)
+        self.sigma = sigma
         self.hard_sigma = 1e6
         self.r = r
         self.L = L # num centers
@@ -171,7 +172,7 @@ class SoftQuantize(torch.nn.Module):
         self.n_features = int(r/m)
         self.softmax = nn.Softmax(dim=2)
         self.sigma_eps = 1e-4
-        self.quant_mode = 0 # 0 = pass through (no quantization), 1 = soft quantization, 2 = return softmax outputs
+        self.quant_mode = 0 # 0 = pass through (no quantization), 1 = soft quantization, 2 = return softmax outputs, 3 = hard quantization with self.hard_sigma
         self.q_hot_template = torch.zeros(bs, self.n_features, self.L).to(device)
         
     def init_centers(self, c):
@@ -194,17 +195,12 @@ class SoftQuantize(torch.nn.Module):
                 sigma = self.hard_sigma
             else:
                 sigma = self.sigma
-            # print(f"--- sigma: {sigma} ---")
             q = self.softmax(-sigma*torch.sum(torch.pow(z - c, 2), 2))
             if self.quant_mode == 2:
                 return q # softmax outputs
-            # elif self.quant_mode == 3: # hard quantization
-            #     q_max = torch.argmax(q, dim=2).view(b,self.n_features,1)
-            #     q = self.q_hot_template.scatter_(2, q_max, 1)
             c = self.c.view(1,self.m,self.L).repeat(b,1,1).transpose(2,1)
             out = torch.matmul(q, c)
             return out.view(b, self.r) # soft quantized outputs
-
 
 def energy_loss(y_gt, y_hat):
     return torch.mean(torch.sum(torch.pow(y_gt - y_hat, 2), dim=1))
@@ -227,7 +223,7 @@ if __name__ == "__main__":
     import copy
     import sys
     sys.path.append("/home/mdelrosa/git/brat")
-    from utils.NMSE_performance import renorm_H4, renorm_sphH4
+    from utils.NMSE_performance import renorm_H4, renorm_sphH4, renorm_muH4, renorm_sphmuH4
     from utils.data_tools import dataset_pipeline_col, subsample_batches
     from utils.parsing import str2bool
     from utils.timing import Timer
@@ -250,13 +246,13 @@ if __name__ == "__main__":
     parser.add_argument("-p2", "--pretrain2_bool", type=str2bool, default=True, help="bool for performing pretrain stage 2 (training initial centers)")
     parser.add_argument("-tr", "--train_bool", type=str2bool, default=True, help="flag for toggling training for soft-to-hard vector quantization")
     parser.add_argument("-lo", "--load_bool", type=str2bool, default=True, help="flag for toggling loading of soft-to-hard vector quantized model")
-    parser.add_argument("-th", "--train_hard_bool", type=str2bool, default=True, help="flag for fine-tuning training on hard vector quantization)")
+    parser.add_argument("-th", "--train_hard_bool", type=str2bool, default=False, help="flag for fine-tuning training on hard vector quantization)")
     parser.add_argument("-nb", "--n_batch", type=int, default=20, help="number of batches to fit on (ignored during debug mode)")
     parser.add_argument("-b", "--beta", type=float, default=1e-5, help="hyperparam for entropy loss")
     parser.add_argument("-l", "--dir", type=str, default=None, help="subdirectory for saving model, checkpoint, history")
     parser.add_argument("-tl", "--tail_dir", type=str, default=None, help="subdirectory for saving model, checkpoint, history of SHVQ network")
     parser.add_argument("-e", "--env", type=str, default="outdoor", help="environment (either indoor or outdoor)")
-    parser.add_argument("-ep", "--epochs", type=int, default=10, help="number of epochs to train for")
+    parser.add_argument("-ep", "--epochs", type=int, default=1000, help="number of epochs to train for")
     parser.add_argument("-ef", "--epochs_finetune", type=int, default=50, help="number of epochs to use for shvq finetuning")
     parser.add_argument("-sp", "--split", type=int, default=0, help="split of entire dataset. must be less than int(<total_num_files> / <n_batch>).")
     parser.add_argument("-t", "--n_truncate", type=int, default=32, help="value to truncate to along delay axis.")
@@ -266,7 +262,7 @@ if __name__ == "__main__":
     parser.add_argument("-L", "--num_centers", type=int, default=256, help="Number of cluster centers for vector quantization")
     parser.add_argument("-m", "--dim_centers", type=int, default=4, help="Dimensions for cluster centers for vector quantization")
     parser.add_argument("-ec", "--epochs_centers", type=int, default=1000, help="Epochs for pretrain2 (cluster center initialization)")
-    parser.add_argument("-K", "--K_sigma", type=int, default=1, help="Epochs for pretrain2 (cluster center initialization)")
+    parser.add_argument("-K", "--K_sigma", type=int, default=100, help="Gain for sigma annealing")
     opt = parser.parse_args()
 
     device = torch.device(f'cuda:{opt.gpu_num}' if torch.cuda.is_available() else 'cpu')
@@ -276,13 +272,16 @@ if __name__ == "__main__":
     if opt.data_type == "norm_H4":
         json_config = "../config/csinet-pro-indoor0001.json" if opt.env == "indoor" else "../config/csinet-pro-outdoor300.json"
     elif opt.data_type == "norm_sphH4":
-        json_config = "../config/csinet-pro-indoor0001-sph.json" if opt.env == "indoor" else "../config/csinet-pro-outdoor300-sph-pow.json"
+        json_config = "../config/csinet-pro-indoor0001-sph-pow.json" if opt.env == "indoor" else "../config/csinet-pro-outdoor300-sph-pow.json"
         # json_config = "../config/csinet-pro-quadriga-indoor0001-sph.json" if opt.env == "indoor" else "../config/csinet-pro-quadriga-outdoor300-sph.json"
+    elif opt.data_type == "norm_muH4":
+        json_config = "../config/csinet-pro-indoor0001-mu.json" if opt.env == "indoor" else "../config/csinet-pro-outdoor300-mu.json"
+    elif opt.data_type == "norm_sphmuH4":
+        json_config = "../config/csinet-pro-indoor0001-sph-mu.json" if opt.env == "indoor" else "../config/csinet-pro-outdoor300-sph-mu.json"
     dataset_spec, minmax_file, img_channels, data_format, norm_range, T, network_name, base_pickle, n_delay, total_num_files, t1_power_file, subsample_prop, thresh_idx_path, diff_spec, init_sigma = get_keys_from_json(json_config, keys=["dataset_spec", "minmax_file", "img_channels", "data_format", "norm_range", "T", "network_name", "base_pickle", "n_delay", "total_num_files", "t1_power_file", "subsample_prop", "thresh_idx_path", "diff_spec", "init_sigma"])
     # aux_bool_list = get_keys_from_json(json_config, keys=["aux_bool"], is_bool=True)
 
     input_dim = (2,32,n_delay)
-
 
     batch_num = 1 if opt.debug_flag else opt.n_batch # dataset batches
     M_1 = None # legacy holdover from CsiNet-LSTM
@@ -303,7 +302,13 @@ if __name__ == "__main__":
     if norm_range == "norm_H4":
         data_all = renorm_H4(data_all, minmax_file)
     elif norm_range == "norm_sphH4":
-        data_all = renorm_sphH4(data_all, minmax_file, t1_power_file, batch_num).astype(np.float32)
+        data_all = renorm_sphH4(data_all, minmax_file, t1_power_file, thresh_idx_path=thresh_idx_path).astype(np.float32)
+    elif norm_range == "norm_muH4":
+        mu = get_keys_from_json(json_config, keys=["mu"])[0]
+        data_all = renorm_muH4(data_all, minmax_file, mu=mu)
+    elif norm_range == "norm_sphmuH4":
+        mu = get_keys_from_json(json_config, keys=["mu"])[0]
+        data_all = renorm_sphmuH4(data_all, minmax_file, t1_power_file, mu=mu, thresh_idx_path=thresh_idx_path).astype(np.float32)
     data_train, data_val = data_all[:n_train], data_all[n_train:]
     print('-> post-renorm: data_val range is from {} to {} -- data_val.shape = {}'.format(np.min(data_val),np.max(data_val),data_val.shape))
 
@@ -315,7 +320,6 @@ if __name__ == "__main__":
     for cr in cr_list:
         train_ldr = torch.utils.data.DataLoader(torch.from_numpy(data_train).to(device), batch_size=batch_size, shuffle=True) 
         valid_ldr = torch.utils.data.DataLoader(torch.from_numpy(data_val).to(device), batch_size=batch_size)
-        all_ldr = torch.utils.data.DataLoader(torch.from_numpy(data_all).to(device), batch_size=batch_size)
 
         encoder = Encoder(input_dim[0], input_dim[1], opt.n_truncate, cr)
         decoder = Decoder(input_dim[0], input_dim[1], opt.n_truncate, cr)
@@ -338,20 +342,22 @@ if __name__ == "__main__":
                                                                 pickle_dir=pickle_dir,
                                                                 network_name=f"{network_name}-pretrain")
         else:
-            csinet_quant.load_state_dict(torch.load(f"{pickle_dir}/{network_name}-pretrain-best-model.pt"), strict=False)
+            csinet_quant.load_state_dict(torch.load(f"{pickle_dir}/{network_name}-pretrain-best-model.pt", map_location=device), strict=False)
             strs = ["checkpoint", "history"]
             load_dict = {}
             for str_i in strs:
                 with open(f"{pickle_dir}/{network_name}-pretrain-{str_i}.pkl", "rb") as f:
                     load_dict[str_i] = pickle.load(f)
                     f.close()
-            checkpoint, history, = load_dict["checkpoint"], load_dict["history"]
+            checkpoint, history = load_dict["checkpoint"], load_dict["history"]
             # optim_state_dict = torch.load(f"{pickle_dir}/{network_name}-pretrain-optimizer.pt")
             # for key, val in optim_state_dict.items():
             #     # print(f"{key}: {val.shape}")
             #     print(f"{key}: {type(val)}")
             optimizer = optim.Adam(csinet_quant.parameters(), lr=learning_rate)
 
+        del train_ldr, valid_ldr
+        all_ldr = torch.utils.data.DataLoader(torch.from_numpy(data_all).to(device), batch_size=batch_size)
         [checkpoint, y_hat, y_test] = score(csinet_quant,
                                             all_ldr,
                                             data_all,
@@ -367,26 +373,35 @@ if __name__ == "__main__":
                                             pow_diff_t=pow_diff
                                             )
 
-
-        if not opt.debug_flag:                
+        if not opt.debug_flag and opt.pretrain1_bool:                
             save_checkpoint_history(checkpoint, history, optimizer, dir=pickle_dir, network_name=f"{network_name}-pretrain")
         
-        del train_ldr, valid_ldr, all_ldr
+        del all_ldr
+        torch.cuda.empty_cache()
 
         if opt.pretrain2_bool:
             # use encoder to get train/validation codewords
+            encoder = csinet_quant.encoder
+            quant = csinet_quant.quant
+            del decoder, csinet_quant
+            torch.cuda.empty_cache()
             with torch.no_grad():
-                enc_train = csinet_quant.encoder(torch.from_numpy(data_train).to(device))
-                enc_valid = csinet_quant.encoder(torch.from_numpy(data_val).to(device))
+                # enc_train = csinet_quant.encoder(torch.from_numpy(data_train).to(device))
+                # enc_valid = csinet_quant.encoder(torch.from_numpy(data_val).to(device))
+                enc_train = encoder(torch.from_numpy(data_train).to(device))
+                enc_valid = encoder(torch.from_numpy(data_val).to(device))
+            # del encoder, decoder, csinet_quant
             enc_train_ldr = torch.utils.data.DataLoader(enc_train, batch_size=batch_size, shuffle=True)
             enc_valid_ldr = torch.utils.data.DataLoader(enc_valid, batch_size=batch_size)
             c = np.random.randint(enc_train.shape[0], size=opt.num_centers)
             sampled_centers = enc_train.view(enc_train.shape[0]*int(opt.rate / opt.dim_centers), opt.dim_centers)[c,:]
-            print(f"--- sampled_centers.shape: {sampled_centers.shape} ---")
-            csinet_quant.quant.init_centers(sampled_centers)
+            # print(f"--- sampled_centers.shape: {sampled_centers.shape} ---")
+            quant.init_centers(sampled_centers)
+            del sampled_centers
+            torch.cuda.empty_cache()
 
             epochs = 1 if opt.debug_flag else opt.epochs_centers # epochs for intial, non-quantized network performance
-            fit(csinet_quant.quant,
+            fit(quant,
                 enc_train_ldr,
                 enc_valid_ldr,
                 batch_num,
@@ -399,20 +414,26 @@ if __name__ == "__main__":
                 network_name="soft-quant")
 
             del enc_train_ldr, enc_valid_ldr
-        else:
-            print(f"--- Loading pretrained SoftQuant layer --- ")
-            csinet_quant.quant.init_centers(torch.zeros(csinet_quant.quant.L, csinet_quant.quant.m).to(device))
-            csinet_quant.quant.load_state_dict(torch.load(f"{pickle_dir}/soft-quant-best-model.pt"))
-            # csinet_quant.quant.load_state_dict(torch.load(f"{pickle_dir}/{network_name}-soft-quant-model.pt"), strict=False)
+            torch.cuda.empty_cache()
+        # else:
+        #     print(f"--- Loading pretrained SoftQuant layer --- ")
+        #     csinet_quant.quant.init_centers(torch.zeros(csinet_quant.quant.L, csinet_quant.quant.m).to(device))
+        #     csinet_quant.quant.load_state_dict(torch.load(f"{pickle_dir}/soft-quant-best-model.pt"))
+        #     # csinet_quant.quant.load_state_dict(torch.load(f"{pickle_dir}/{network_name}-soft-quant-model.pt"), strict=False)
 
-        encoder = csinet_quant.encoder
-        decoder = csinet_quant.decoder
+        encoder = Encoder(input_dim[0], input_dim[1], opt.n_truncate, cr)
+        decoder = Decoder(input_dim[0], input_dim[1], opt.n_truncate, cr)
+        # encoder = csinet_quant.encoder
+        # decoder = csinet_quant.decoder
         # sigma = csinet_quant.quant.sigma.relu().item() + csinet_quant.quant.sigma_eps
-        quant = SoftQuantize(cr, opt.num_centers, opt.dim_centers, sigma=csinet_quant.quant.sigma, sigma_trainable=False, device=device)
+        quant = SoftQuantize(cr, opt.num_centers, opt.dim_centers, sigma=quant.sigma, sigma_trainable=False, device=device)
 
-        quant.init_centers(csinet_quant.quant.c.data)
+
         # quant.load_state_dict(OrderedDict({'c': }))
         csinet_quant = CsiNetQuant(encoder, decoder, quant, cr, K_sigma=opt.K_sigma, device=device).to(device) # remake network with non-trainable sigma
+        csinet_quant.load_state_dict(torch.load(f"{pickle_dir}/{network_name}-pretrain-best-model.pt", map_location=device), strict=False)
+        csinet_quant.quant.init_centers(torch.zeros(csinet_quant.quant.L, csinet_quant.quant.m).to(device))
+        csinet_quant.quant.load_state_dict(torch.load(f"{pickle_dir}/soft-quant-best-model.pt"))
 
         csinet_quant.quant.quant_mode = 1 # train with quantization layer
         print(f"-> sigma: {csinet_quant.quant.sigma}")
@@ -439,6 +460,7 @@ if __name__ == "__main__":
         init_nmse = checkpoint["best_nmse"] # save nmse from checkpoint
         print(f"--- after center pretraining, init_nmse={init_nmse} ---")
         del all_ldr
+        torch.cuda.empty_cache()
 
         # profile_network(csinet_quant,
         #                 train_ldr,
@@ -479,13 +501,13 @@ if __name__ == "__main__":
         elif opt.load_bool:
             model_weights_name = f"{pickle_dir}/{network_name}-best-model.pt"
             print(f"---- Loading best model from {model_weights_name} ---")
-            csinet_quant.load_state_dict(torch.load(model_weights_name))
+            csinet_quant.load_state_dict(torch.load(model_weights_name, map_location=device))
             csinet_quant.quant.quant_mode = 1 # train with quantization layer
             checkpoint_name = f"{pickle_dir}/{network_name}-checkpoint.pkl"
             with open(checkpoint_name, 'rb') as f:
                 checkpoint = pickle.load(f)
                 f.close()
-            csinet_quant.quant.sigma = checkpoint["best_sigma"]
+            csinet_quant.quant.sigma = checkpoint["best_sigma"].to(device)
         else:
             print(f"---- Model performance without soft-to-hard vector quantization ---")
             checkpoint = {"best_sigma": csinet_quant.quant.sigma, "latest_model": csinet_quant}
@@ -493,6 +515,7 @@ if __name__ == "__main__":
             optimizer = torch.optim.Adam(csinet_quant.parameters())
 
         del train_ldr, valid_ldr
+        torch.cuda.empty_cache()
         all_ldr = torch.utils.data.DataLoader(torch.from_numpy(data_all).to(device), batch_size=batch_size)
         [checkpoint, y_hat, y_test] = score(csinet_quant,
                                             all_ldr,
@@ -511,10 +534,11 @@ if __name__ == "__main__":
                                             )
         history["init_nmse"] = init_nmse
 
-        if not opt.debug_flag:                
+        if not opt.debug_flag and opt.train_bool:                
             save_checkpoint_history(checkpoint, history, optimizer, dir=pickle_dir, network_name=network_name)
 
         del all_ldr
+        torch.cuda.empty_cache()
         train_ldr = torch.utils.data.DataLoader(torch.from_numpy(data_train).to(device), batch_size=batch_size, shuffle=True) 
         valid_ldr = torch.utils.data.DataLoader(torch.from_numpy(data_val).to(device), batch_size=batch_size)
 
@@ -538,6 +562,7 @@ if __name__ == "__main__":
         #     csinet_quant.load_state_dict(torch.load(model_weights_name))
 
         del train_ldr, valid_ldr
+        torch.cuda.empty_cache()
         all_ldr = torch.utils.data.DataLoader(torch.from_numpy(data_all).to(device), batch_size=batch_size)
         [checkpoint, y_hat, y_test] = score(csinet_quant,
                                             all_ldr,
@@ -560,3 +585,4 @@ if __name__ == "__main__":
         #     save_checkpoint_history(checkpoint, history, optimizer, dir=pickle_dir, network_name=f"{network_name}-hard")
 
         del all_ldr
+        torch.cuda.empty_cache()
